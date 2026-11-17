@@ -186,11 +186,30 @@ BACKUP_CREATED_UTC=""
 DB_SHA256=""
 BIN_SHA256=""
 
-if [[ -f "${stage_dir}/backup-meta.env" ]]; then
-    # shellcheck disable=SC1090
-    source "${stage_dir}/backup-meta.env"
-    log_info "Backup Metadata: Version=${PANEL_VERSION:-unknown}, Port=${PANEL_PORT:-unknown}, Created=${BACKUP_CREATED_UTC:-unknown}"
-fi
+# Read only allowlisted fields as inert data. Never 'source' an archive file as root.
+read_meta() {
+    local key="$1"
+    sed -n "s/^${key}=\"\\([^\"]*\\)\"$/\\1/p" "${stage_dir}/backup-meta.env" | head -n 1
+}
+PANEL_VERSION="$(read_meta PANEL_VERSION)"
+PANEL_PORT="$(read_meta PANEL_PORT)"
+BACKUP_CREATED_UTC="$(read_meta BACKUP_CREATED_UTC)"
+DB_SHA256="$(read_meta DB_SHA256)"
+BIN_SHA256="$(read_meta BIN_SHA256)"
+[[ "${DB_SHA256}" =~ ^[0-9a-f]{64}$ && "${BIN_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
+    log_err "Backup manifest missing valid SHA256 fields; refusing restore"
+    exit 1
+}
+[[ "$(sha256sum "${stage_dir}/db/x-ui.db" | awk '{print $1}')" == "${DB_SHA256}" &&
+   "$(sha256sum "${stage_dir}/main/x-ui" | awk '{print $1}')" == "${BIN_SHA256}" ]] || {
+    log_err "Archived binary or database does not match backup manifest; refusing restore"
+    exit 1
+}
+[[ -z "${PANEL_PORT}" || "${PANEL_PORT}" =~ ^[0-9]{1,5}$ ]] || {
+    log_err "Backup metadata has invalid panel port"
+    exit 1
+}
+log_info "Backup Metadata: Version=${PANEL_VERSION:-unknown}, Port=${PANEL_PORT:-unknown}, Created=${BACKUP_CREATED_UTC:-unknown}"
 
 if [[ "${auto_mode}" -eq 0 ]]; then
     read -rp "Confirm restoring this backup? This will stop x-ui and restore files [y/N]: " confirm
