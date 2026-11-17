@@ -475,7 +475,15 @@ fi
 
 for item in "${stage_dir}/x-ui/bin/"*; do
     [[ -e "${item}" ]] || continue
-    [[ "$(basename "${item}")" == "config.json" ]] && continue
+    item_name="$(basename "${item}")"
+    # Never replace the generated Xray configuration, even on explicit runtime upgrade.
+    [[ "${item_name}" == "config.json" ]] && continue
+    # This is a clean panel-only upgrade. Preserve working Xray/MTG/geo data
+    # unless the operator explicitly opts into upgrading bundled runtime dependencies.
+    if [[ -e "${xui_folder}/bin/${item_name}" &&
+          "${XUI_UPGRADE_RUNTIME_DEPS:-0}" != "1" ]]; then
+        continue
+    fi
     cp -rf "${item}" "${xui_folder}/bin/"
 done
 chmod +x "${xui_folder}"/bin/xray-linux-* "${xui_folder}"/bin/mtg-linux-* 2>/dev/null || true
