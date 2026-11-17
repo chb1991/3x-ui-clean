@@ -96,3 +96,44 @@ set -e
 [[ "${status}" -ne 0 ]] || { echo 'Rollback accepted tampered archive' >&2; exit 1; }
 [[ ! -e "${TEST_STOP_LOG}" ]] || { echo 'Rollback preflight stopped service' >&2; exit 1; }
 echo 'PASS: corrupt rollback rejected before downtime'
+
+# A fully checksummed offline bundle must still abort safely if systemctl stop fails.
+# The fake systemctl above deliberately returns 99 and logs attempts to stop.
+kill "${WRITER_PID}" 2>/dev/null || true
+wait "${WRITER_PID}" 2>/dev/null || true
+WRITER_PID=''
+old_bin_hash="$(sha256sum "${T}/app/x-ui" | cut -d' ' -f1)"
+old_db_hash="$(sha256sum "${T}/db/x-ui.db" | cut -d' ' -f1)"
+mkdir -p "${T}/fake-package/x-ui/bin" "${T}/bundle/3x-ui-clean-offline/scripts"
+cp "${T}/app/x-ui" "${T}/fake-package/x-ui/x-ui"
+cp "${T}/app/bin/config.json" "${T}/fake-package/x-ui/bin/config.json"
+cp scripts/rollback.sh "${T}/bundle/3x-ui-clean-offline/scripts/"
+(
+    cd "${T}/fake-package"
+    tar -czf "${T}/bundle/3x-ui-clean-offline/x-ui-linux-amd64.tar.gz" x-ui
+)
+(
+    cd "${T}/bundle/3x-ui-clean-offline"
+    sha256sum x-ui-linux-amd64.tar.gz > x-ui-linux-amd64.tar.gz.sha256
+)
+(
+    cd "${T}/bundle"
+    tar -czf "${T}/checksummed-bundle.tar.gz" 3x-ui-clean-offline
+)
+(
+    cd "${T}"
+    sha256sum checksummed-bundle.tar.gz > checksummed-bundle.tar.gz.sha256
+)
+set +e
+output="$(bash scripts/update.sh --yes --offline "${T}/checksummed-bundle.tar.gz" 2>&1)"
+status=$?
+set -e
+[[ "${status}" -ne 0 ]] || { echo 'Updater continued after failed systemctl stop' >&2; exit 1; }
+[[ -e "${TEST_STOP_LOG}" ]] || { echo "Stop failure path was not exercised: ${output}" >&2; exit 1; }
+[[ "$(sha256sum "${T}/app/x-ui" | cut -d' ' -f1)" == "${old_bin_hash}" ]] || {
+    echo 'Original binary changed despite failed stop' >&2; exit 1;
+}
+[[ "$(sha256sum "${T}/db/x-ui.db" | cut -d' ' -f1)" == "${old_db_hash}" ]] || {
+    echo 'Original database changed despite failed stop' >&2; exit 1;
+}
+echo 'PASS: failed systemctl stop leaves original binary and database untouched'
