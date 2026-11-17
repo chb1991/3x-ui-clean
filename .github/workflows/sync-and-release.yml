@@ -1,6 +1,17 @@
 name: Sync Upstream & Release 3X-UI Clean
 
 on:
+  # A reviewed change to the maintenance scripts automatically rebuilds the
+  # stable release only after PR merge (never while still in a draft PR).
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - 'tests/**'
+      - 'patches/**'
+      - 'install.sh'
+      - 'update.sh'
+      - '.github/workflows/sync-and-release.yml'
   schedule:
     # Check upstream MHSanaei/3x-ui for new stable releases daily at 02:00 UTC
     - cron: '0 2 * * *'
@@ -21,6 +32,10 @@ on:
         required: false
         default: false
         type: boolean
+
+concurrency:
+  group: clean-stable-release
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -51,13 +66,18 @@ jobs:
           cmp scripts/install.sh install.sh
           cmp scripts/update.sh update.sh
           sudo -E bash tests/maintenance-smoke.sh
+          docker run --rm -v "${PWD}:/work:ro" -w /work debian:trixie bash -ec '
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 procps util-linux iproute2 >/dev/null
+            bash tests/debian13-migration-failure.sh
+          '
 
       - name: Resolve target upstream tag
         id: check
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_TAG: ${{ inputs.upstream_tag }}
-          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild || github.event_name == 'push' }}
           ALL_ARCHS: ${{ inputs.build_all_archs }}
         run: |
           set -euo pipefail
