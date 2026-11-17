@@ -1,0 +1,9 @@
+# Temporary upstream source checkout & build artifacts
+upstream-src/
+dist/
+build/
+*.tar.gz
+*.zip
+*.sha256
+.DS_Store
+Thumbs.db

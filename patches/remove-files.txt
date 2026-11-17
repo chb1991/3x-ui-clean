@@ -1,0 +1,11 @@
+frontend/src/api/queries/useSponsorsQuery.ts
+frontend/src/components/sponsor/SponsorCard.css
+frontend/src/components/sponsor/SponsorCard.stories.tsx
+frontend/src/components/sponsor/SponsorCard.tsx
+frontend/src/components/sponsor/SponsorSlot.tsx
+frontend/src/lib/sponsors.ts
+frontend/src/pages/sponsors/SponsorsPage.css
+frontend/src/pages/sponsors/SponsorsPage.tsx
+frontend/src/test/sponsors.test.tsx
+internal/web/service/panel/sponsor.go
+internal/web/service/panel/sponsor_test.go

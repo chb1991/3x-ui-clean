@@ -1,0 +1,63 @@
+name: Verify Clean Patch Compatibility
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'patches/**'
+      - 'scripts/**'
+      - '.github/workflows/ci-verify-patch.yml'
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  verify-patch:
+    name: Verify Patch on Upstream (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [latest-release, main]
+    steps:
+      - name: Checkout 3x-ui-clean
+        uses: actions/checkout@v4
+
+      - name: Clone Upstream (${{ matrix.target }})
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [[ "${{ matrix.target }}" == "latest-release" ]]; then
+            REF="$(gh api repos/MHSanaei/3x-ui/releases/latest --jq '.tag_name')"
+          else
+            REF="main"
+          fi
+          echo "Testing against upstream ref: ${REF}"
+          git clone --branch "${REF}" --depth 1 https://github.com/MHSanaei/3x-ui.git upstream-src
+
+      - name: Run apply-clean.sh & Semantic Guard
+        run: |
+          CLEAN_REPO="${GITHUB_REPOSITORY}" bash patches/apply-clean.sh upstream-src
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: upstream-src/go.mod
+          check-latest: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: upstream-src/.nvmrc
+          cache: 'npm'
+          cache-dependency-path: upstream-src/frontend/package-lock.json
+
+      - name: Verify Codegen, TypeScript & Go Compilation
+        working-directory: upstream-src
+        run: |
+          go run ./tools/openapigen
+          cd frontend
+          npm ci
+          npm run typecheck
+          npm run build
+          cd ..
+          go test -v ./internal/web -run TestRoutesContract

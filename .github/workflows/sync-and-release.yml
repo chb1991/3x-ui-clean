@@ -1,0 +1,422 @@
+name: Sync Upstream & Release 3X-UI Clean
+
+on:
+  schedule:
+    # Check upstream MHSanaei/3x-ui for new stable releases daily at 02:00 UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: 'Upstream tag to build (e.g. v3.11.0). Leave empty for latest stable release.'
+        required: false
+        default: ''
+        type: string
+      force_rebuild:
+        description: 'Force rebuild even if this tag is already released'
+        required: false
+        default: false
+        type: boolean
+      build_all_archs:
+        description: 'Build all 7 architectures (false = amd64 & arm64 only for fast builds)'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  # ============================================================================
+  # Job 1: Resolve Upstream Tag, Verify Patch & Semantic Guard, Package GPL Source
+  # ============================================================================
+  prepare-and-verify:
+    name: Check Upstream & Verify Clean Patch
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      tag: ${{ steps.check.outputs.tag }}
+      upstream_sha: ${{ steps.patch.outputs.upstream_sha }}
+      platforms: ${{ steps.check.outputs.platforms }}
+    steps:
+      - name: Checkout 3x-ui-clean repository
+        uses: actions/checkout@v4
+
+      - name: Resolve target upstream tag
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ inputs.upstream_tag }}
+          FORCE_REBUILD: ${{ inputs.force_rebuild }}
+          ALL_ARCHS: ${{ inputs.build_all_archs }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${INPUT_TAG}" ]]; then
+            TAG="${INPUT_TAG}"
+          else
+            TAG="$(gh api repos/MHSanaei/3x-ui/releases/latest --jq '.tag_name')"
+          fi
+          if [[ -z "${TAG}" || "${TAG}" == "null" ]]; then
+            echo "Failed to resolve upstream release tag" >&2
+            exit 1
+          fi
+          echo "Resolved upstream tag: ${TAG}"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+
+          if [[ "${ALL_ARCHS}" == "true" ]]; then
+            echo 'platforms=["amd64","arm64","armv7","armv6","386","armv5","s390x"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'platforms=["amd64","arm64"]' >> "$GITHUB_OUTPUT"
+          fi
+
+          if [[ "${FORCE_REBUILD}" == "true" ]]; then
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            echo "Release ${TAG} already exists in ${GITHUB_REPOSITORY}. Skipping build."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New upstream release ${TAG} detected! Proceeding with Clean build."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Clone upstream MHSanaei/3x-ui at ${{ steps.check.outputs.tag }}
+        if: steps.check.outputs.should_build == 'true'
+        run: |
+          git clone --branch "${{ steps.check.outputs.tag }}" --depth 1 \
+            https://github.com/MHSanaei/3x-ui.git upstream-src
+
+      - name: Apply 3X-UI Clean Patch & Semantic Guard
+        id: patch
+        if: steps.check.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          UPSTREAM_SHA="$(git -C upstream-src rev-parse HEAD)"
+          echo "upstream_sha=${UPSTREAM_SHA}" >> "$GITHUB_OUTPUT"
+
+          CLEAN_REPO="${GITHUB_REPOSITORY}" bash patches/apply-clean.sh upstream-src
+
+          # Save patched shell & service files for repo sync
+          mkdir -p synced-files
+          cp -f upstream-src/x-ui.sh synced-files/
+          cp -f upstream-src/x-ui.service.debian synced-files/
+          cp -f upstream-src/x-ui.service.arch synced-files/
+          cp -f upstream-src/x-ui.service.rhel synced-files/
+          cp -f upstream-src/x-ui.rc synced-files/
+
+      - name: Setup Go
+        if: steps.check.outputs.should_build == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: upstream-src/go.mod
+          check-latest: true
+
+      - name: Setup Node.js
+        if: steps.check.outputs.should_build == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: upstream-src/.nvmrc
+          cache: 'npm'
+          cache-dependency-path: upstream-src/frontend/package-lock.json
+
+      - name: Regenerate OpenAPI/Zod schemas, Typecheck Frontend & Run Route Contract Tests
+        if: steps.check.outputs.should_build == 'true'
+        working-directory: upstream-src
+        run: |
+          go run ./tools/openapigen
+          cd frontend
+          npm ci
+          npm run typecheck
+          npm run build
+          cd ..
+          go test -v ./internal/web -run TestRoutesContract
+
+      - name: Package Patched Corresponding Source (GPL-3.0 Compliance)
+        if: steps.check.outputs.should_build == 'true'
+        run: |
+          TAG="${{ steps.check.outputs.tag }}"
+          SRC_ARCHIVE="3x-ui-clean-${TAG}-source.tar.gz"
+          tar --exclude='./upstream-src/.git' \
+              --exclude='./upstream-src/frontend/node_modules' \
+              --exclude='./upstream-src/internal/web/dist' \
+              -czf "${SRC_ARCHIVE}" upstream-src patches scripts LICENSE README.md
+          sha256sum "${SRC_ARCHIVE}" > "${SRC_ARCHIVE}.sha256"
+
+      - name: Upload Patched Source & Synced Files Artifact
+        if: steps.check.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: clean-source-and-meta
+          path: |
+            3x-ui-clean-${{ steps.check.outputs.tag }}-source.tar.gz*
+            synced-files/*
+
+  # ============================================================================
+  # Job 2: Build Static Linux Packages & Offline Installer Bundles
+  # ============================================================================
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: prepare-and-verify
+    if: needs.prepare-and-verify.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJson(needs.prepare-and-verify.outputs.platforms) }}
+    steps:
+      - name: Checkout 3x-ui-clean repository
+        uses: actions/checkout@v4
+
+      - name: Download Patched Source Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: clean-source-and-meta
+          path: ./meta-artifacts
+
+      - name: Clone & Patch Upstream (${{ needs.prepare-and-verify.outputs.tag }})
+        run: |
+          git clone --branch "${{ needs.prepare-and-verify.outputs.tag }}" --depth 1 \
+            https://github.com/MHSanaei/3x-ui.git upstream-src
+          CLEAN_REPO="${GITHUB_REPOSITORY}" bash patches/apply-clean.sh upstream-src
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: upstream-src/go.mod
+          check-latest: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: upstream-src/.nvmrc
+          cache: 'npm'
+          cache-dependency-path: upstream-src/frontend/package-lock.json
+
+      - name: Build Frontend Bundle
+        working-directory: upstream-src
+        run: |
+          go run ./tools/openapigen
+          cd frontend
+          npm ci
+          npm run build
+
+      - name: Compile Static 3X-UI Binary & Assemble Release Archive
+        working-directory: upstream-src
+        run: |
+          set -euo pipefail
+          CURL_RETRY="--retry 5 --retry-all-errors --retry-delay 3"
+          fetch() { wget -q --tries=5 --waitretry=10 --retry-on-http-error=429,500,502,503 "$@"; }
+
+          export CGO_ENABLED=1
+          export GOOS=linux
+          export GOARCH=${{ matrix.platform }}
+          case "${{ matrix.platform }}" in
+            amd64) BOOTLIN_ARCH="x86-64" ;;
+            arm64) BOOTLIN_ARCH="aarch64" ;;
+            armv7) BOOTLIN_ARCH="armv7-eabihf"; export GOARCH=arm GOARM=7 ;;
+            armv6) BOOTLIN_ARCH="armv6-eabihf"; export GOARCH=arm GOARM=6 ;;
+            armv5) BOOTLIN_ARCH="armv5-eabi"; export GOARCH=arm GOARM=5 ;;
+            386)   BOOTLIN_ARCH="x86-i686" ;;
+            s390x) BOOTLIN_ARCH="s390x-z13" ;;
+          esac
+
+          echo "Downloading Bootlin musl cross-toolchain for ${BOOTLIN_ARCH}..."
+          TARBALL_BASE="https://toolchains.bootlin.com/downloads/releases/toolchains/$BOOTLIN_ARCH/tarballs/"
+          TARBALL_URL=$(curl -fsSL $CURL_RETRY "$TARBALL_BASE" | grep -oE "${BOOTLIN_ARCH}--musl--stable-[^\"]+\\.tar\\.xz" | sort -r | head -n1)
+          [ -z "$TARBALL_URL" ] && { echo "Failed to locate Bootlin musl toolchain" >&2; exit 1; }
+
+          cd /tmp
+          curl -fL -sS $CURL_RETRY -o "$(basename "$TARBALL_URL")" "$TARBALL_BASE/$TARBALL_URL"
+          tar -xf "$(basename "$TARBALL_URL")"
+          TOOLCHAIN_DIR=$(find . -maxdepth 1 -type d -name "${BOOTLIN_ARCH}--musl--stable-*" | head -n1)
+          export PATH="$(realpath "$TOOLCHAIN_DIR")/bin:$PATH"
+          export CC=$(realpath "$(find "$TOOLCHAIN_DIR/bin" -name '*-gcc.br_real' -type f -executable | head -n1)")
+          cd -
+
+          # Build stable static binary (keep config.IsDevBuild() == false)
+          LDFLAGS="-w -s -linkmode external -extldflags '-static'"
+          go build -buildvcs=true -ldflags "$LDFLAGS" -o xui-release -v .
+          file xui-release
+          ldd xui-release || echo "Static binary confirmed"
+
+          mkdir -p x-ui/bin
+          cp xui-release x-ui/x-ui
+          cp x-ui.service.debian x-ui/
+          cp x-ui.service.arch x-ui/
+          cp x-ui.service.rhel x-ui/
+          cp x-ui.rc x-ui/ 2>/dev/null || true
+          cp x-ui.sh x-ui/
+
+          # Extract Xray_URL from upstream's own release.yml so Xray version stays in sync
+          Xray_URL=$(grep -oE 'https://github.com/XTLS/Xray-core/releases/download/v[0-9.]+/' .github/workflows/release.yml | head -n1 || true)
+          Xray_URL="${Xray_URL:-https://github.com/XTLS/Xray-core/releases/download/v26.10.21/}"
+          echo "Using Xray_URL=${Xray_URL}"
+
+          cd x-ui/bin
+          case "${{ matrix.platform }}" in
+            amd64) fetch "${Xray_URL}Xray-linux-64.zip" && unzip -q Xray-linux-64.zip && rm -f Xray-linux-64.zip ;;
+            arm64) fetch "${Xray_URL}Xray-linux-arm64-v8a.zip" && unzip -q Xray-linux-arm64-v8a.zip && rm -f Xray-linux-arm64-v8a.zip ;;
+            armv7) fetch "${Xray_URL}Xray-linux-arm32-v7a.zip" && unzip -q Xray-linux-arm32-v7a.zip && rm -f Xray-linux-arm32-v7a.zip ;;
+            armv6) fetch "${Xray_URL}Xray-linux-arm32-v6.zip" && unzip -q Xray-linux-arm32-v6.zip && rm -f Xray-linux-arm32-v6.zip ;;
+            386)   fetch "${Xray_URL}Xray-linux-32.zip" && unzip -q Xray-linux-32.zip && rm -f Xray-linux-32.zip ;;
+            armv5) fetch "${Xray_URL}Xray-linux-arm32-v5.zip" && unzip -q Xray-linux-arm32-v5.zip && rm -f Xray-linux-arm32-v5.zip ;;
+            s390x) fetch "${Xray_URL}Xray-linux-s390x.zip" && unzip -q Xray-linux-s390x.zip && rm -f Xray-linux-s390x.zip ;;
+          esac
+
+          rm -f geoip.dat geosite.dat
+          fetch https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat
+          fetch https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat
+          fetch -O geoip_IR.dat https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geoip.dat
+          fetch -O geosite_IR.dat https://github.com/chocolate4u/Iran-v2ray-rules/releases/latest/download/geosite.dat
+          fetch -O geoip_RU.dat https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geoip.dat
+          fetch -O geosite_RU.dat https://github.com/runetfreedom/russia-v2ray-rules-dat/releases/latest/download/geosite.dat
+          mv xray "xray-linux-${{ matrix.platform }}"
+
+          case "${{ matrix.platform }}" in
+            amd64|arm64|armv7|armv6|386)
+              MTG_MULTI_VER=$(curl -sf $CURL_RETRY -o /dev/null -w '%{redirect_url}' "https://github.com/mhsanaei/mtg-multi/releases/latest" | sed -n 's#.*/releases/tag/##p')
+              MTG_PKG="mtg-multi-${MTG_MULTI_VER#v}-linux-${{ matrix.platform }}"
+              curl -sfLRO $CURL_RETRY "https://github.com/mhsanaei/mtg-multi/releases/download/${MTG_MULTI_VER}/${MTG_PKG}.tar.gz"
+              tar -xzf "${MTG_PKG}.tar.gz"
+              mv "${MTG_PKG}/mtg-multi" "mtg-linux-${{ matrix.platform }}"
+              rm -rf "${MTG_PKG}" "${MTG_PKG}.tar.gz"
+              ;;
+          esac
+          cd ../..
+
+          # 1. Standard Online/Panel Updater Package
+          tar -zcvf "../x-ui-linux-${{ matrix.platform }}.tar.gz" x-ui
+          cd ..
+          sha256sum "x-ui-linux-${{ matrix.platform }}.tar.gz" > "x-ui-linux-${{ matrix.platform }}.tar.gz.sha256"
+
+          # 2. Complete Self-Contained Offline Bundle (includes scripts + GPL source)
+          TAG="${{ needs.prepare-and-verify.outputs.tag }}"
+          OFFLINE_DIR="3x-ui-clean-offline"
+          OFFLINE_TAR="3x-ui-clean-${TAG}-linux-${{ matrix.platform }}-offline.tar.gz"
+          mkdir -p "${OFFLINE_DIR}/scripts"
+          cp "x-ui-linux-${{ matrix.platform }}.tar.gz" "${OFFLINE_DIR}/"
+          cp "x-ui-linux-${{ matrix.platform }}.tar.gz.sha256" "${OFFLINE_DIR}/"
+          cp scripts/*.sh "${OFFLINE_DIR}/scripts/"
+          cp install.sh update.sh x-ui.sh LICENSE README.md "${OFFLINE_DIR}/"
+          cp meta-artifacts/3x-ui-clean-${TAG}-source.tar.gz* "${OFFLINE_DIR}/" 2>/dev/null || true
+          chmod +x "${OFFLINE_DIR}"/*.sh "${OFFLINE_DIR}/scripts/"*.sh
+
+          tar -czf "${OFFLINE_TAR}" "${OFFLINE_DIR}"
+          sha256sum "${OFFLINE_TAR}" > "${OFFLINE_TAR}.sha256"
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.platform }}
+          path: |
+            x-ui-linux-${{ matrix.platform }}.tar.gz*
+            3x-ui-clean-${{ needs.prepare-and-verify.outputs.tag }}-linux-${{ matrix.platform }}-offline.tar.gz*
+
+  # ============================================================================
+  # Job 3: Sync Repo Metadata & Publish GitHub Release
+  # ============================================================================
+  publish:
+    name: Publish GitHub Release
+    needs: [prepare-and-verify, build]
+    if: needs.prepare-and-verify.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout 3x-ui-clean repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Commit Synced Version, Scripts & Changelog, Tag & Publish Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.prepare-and-verify.outputs.tag }}
+          UPSTREAM_SHA: ${{ needs.prepare-and-verify.outputs.upstream_sha }}
+        run: |
+          set -euo pipefail
+          # Copy synced upstream scripts into repo root
+          if [[ -d release-assets/synced-files ]]; then
+            cp -f release-assets/synced-files/* .
+            rm -rf release-assets/synced-files
+          fi
+          chmod +x x-ui.sh install.sh update.sh scripts/*.sh patches/*.sh
+
+          echo "${TAG}" > UPSTREAM_VERSION
+          BUILD_DATE="$(date -u +%Y-%m-%d)"
+
+          cd release-assets
+          sha256sum *.tar.gz > SHA256SUMS.txt
+          cd ..
+
+          # Update CHANGELOG-CLEAN.md
+          {
+            echo "## ${TAG} (${BUILD_DATE})"
+            echo ""
+            echo "- **Upstream Release**: [\`MHSanaei/3x-ui@${TAG}\`](https://github.com/MHSanaei/3x-ui/releases/tag/${TAG})"
+            echo "- **Upstream Commit**: \`${UPSTREAM_SHA}\`"
+            echo "- **License**: GNU GPL v3.0"
+            echo "- **Modifications Applied**:"
+            echo "  - Removed sponsor/ad backend service (\`internal/web/service/panel/sponsor.go\`) and outbound requests to \`MHSanaei/sponsors\`."
+            echo "  - Removed \`/sponsors\` and \`/sponsors/logo/:name\` public endpoints from \`internal/web/controller/index.go\`."
+            echo "  - Removed frontend sponsor slots (\`LoginPage.tsx\`, \`IndexPage.tsx\`), \`/sponsors\` route & menu entry (\`panelRoutes.tsx\`), and sidebar Donate link (\`AppSidebar.tsx\`)."
+            echo "  - Redirected in-panel & CLI self-updater (\`panel.go\`, \`x-ui.sh\`, \`update.sh\`, \`install.sh\`) to \`${GITHUB_REPOSITORY}\`."
+            echo ""
+            echo "### SHA256 Checksums"
+            echo '```text'
+            cat release-assets/SHA256SUMS.txt
+            echo '```'
+            echo ""
+            if [[ -f CHANGELOG-CLEAN.md ]]; then
+              cat CHANGELOG-CLEAN.md
+            fi
+          } > CHANGELOG-CLEAN.md.new
+          mv -f CHANGELOG-CLEAN.md.new CHANGELOG-CLEAN.md
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add UPSTREAM_VERSION CHANGELOG-CLEAN.md x-ui.sh x-ui.service.* x-ui.rc
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): sync upstream ${TAG} (${UPSTREAM_SHA::8})"
+            git push origin HEAD:main
+          fi
+
+          git tag -f "${TAG}"
+          git push -f origin "refs/tags/${TAG}"
+
+          NOTES_FILE="$(mktemp)"
+          {
+            echo "## 3X-UI Clean ${TAG} (Ad-Free Edition)"
+            echo ""
+            echo "Built automatically from official upstream [\`MHSanaei/3x-ui ${TAG}\`](https://github.com/MHSanaei/3x-ui/releases/tag/${TAG}) (commit \`${UPSTREAM_SHA}\`) under **GNU GPL v3.0**."
+            echo ""
+            echo "### Online One-Line Install / Safe Upgrade"
+            echo '```bash'
+            echo "bash <(curl -fsSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/scripts/install.sh)"
+            echo '```'
+            echo ""
+            echo "### SHA256 Checksums"
+            echo '```text'
+            cat release-assets/SHA256SUMS.txt
+            echo '```'
+          } > "${NOTES_FILE}"
+
+          if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+            gh release edit "${TAG}" --latest=true --prerelease=false \
+              --title "3X-UI Clean ${TAG}" --notes-file "${NOTES_FILE}"
+          else
+            gh release create "${TAG}" --latest=true --prerelease=false \
+              --target main --title "3X-UI Clean ${TAG}" --notes-file "${NOTES_FILE}"
+          fi
+
+          gh release upload "${TAG}" \
+            release-assets/*.tar.gz \
+            release-assets/*.sha256 \
+            release-assets/SHA256SUMS.txt \
+            --clobber

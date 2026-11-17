@@ -1,0 +1,241 @@
+diff --git a/frontend/src/api/queryKeys.ts b/frontend/src/api/queryKeys.ts
+index ee634497..7aac1b22 100644
+--- a/frontend/src/api/queryKeys.ts
++++ b/frontend/src/api/queryKeys.ts
+@@ -1,5 +1,4 @@
+ export const keys = {
+-  sponsors: () => ['sponsors'] as const,
+   server: {
+     status: () => ['server', 'status'] as const,
+     fail2banStatus: () => ['server', 'fail2banStatus'] as const,
+diff --git a/frontend/src/components/command-palette/CommandPalette.tsx b/frontend/src/components/command-palette/CommandPalette.tsx
+index ca850552..b7832c18 100644
+--- a/frontend/src/components/command-palette/CommandPalette.tsx
++++ b/frontend/src/components/command-palette/CommandPalette.tsx
+@@ -83,7 +83,6 @@ export const PALETTE_KEYWORDS: Record<string, string[]> = {
+   '/settings': ['settings', 'config', 'port', 'password', 'ssl', 'telegram'],
+   '/xray': ['xray', 'templates', 'balancer', 'dns'],
+   '/api-docs': ['api', 'api docs', 'swagger', 'rest api', 'endpoints'],
+-  '/sponsors': ['sponsors', 'sponsor', 'partners'],
+ };
+ 
+ export default function CommandPalette() {
+diff --git a/frontend/src/layouts/AppSidebar.tsx b/frontend/src/layouts/AppSidebar.tsx
+index e86cc260..9f81ff10 100644
+--- a/frontend/src/layouts/AppSidebar.tsx
++++ b/frontend/src/layouts/AppSidebar.tsx
+@@ -13,7 +13,6 @@ import {
+   DatabaseOutlined,
+   DiscordOutlined,
+   GithubOutlined,
+-  HeartOutlined,
+   LogoutOutlined,
+   MailOutlined,
+   MenuOutlined,
+@@ -37,7 +36,6 @@ import { useCommandPalette } from '@/components/command-palette/useCommandPalett
+ import { PANEL_ROUTES } from '@/routes/panelRoutes';
+ import './AppSidebar.css';
+ 
+-const DONATE_URL = 'https://donate.sanaei.dev/';
+ // The palette listens for Ctrl as well as Cmd, so the chip must not show a
+ // Mac glyph to the Linux and Windows operators who are most of this panel's.
+ const SHORTCUT_MODIFIER = /Mac|iPhone|iPad|iPod/.test(navigator.userAgent) ? '⌘' : 'Ctrl';
+@@ -50,21 +48,6 @@ const SIDEBAR_PINNED_KEY = 'sidebar-pinned';
+ 
+ let hoveredAcrossRemounts = false;
+ 
+-function DonateButton({ ariaLabel }: { ariaLabel: string }) {
+-  return (
+-    <a
+-      href={DONATE_URL}
+-      target="_blank"
+-      rel="noopener noreferrer"
+-      className="sidebar-donate"
+-      aria-label={ariaLabel}
+-      title={ariaLabel}
+-    >
+-      <HeartOutlined aria-hidden />
+-    </a>
+-  );
+-}
+-
+ function DocsButton({ ariaLabel }: { ariaLabel: string }) {
+   return (
+     <a
+@@ -382,7 +365,6 @@ export default function AppSidebar() {
+                 {pinned ? <PushpinFilled aria-hidden /> : <PushpinOutlined aria-hidden />}
+               </button>
+               <DocsButton ariaLabel={t('menu.docs') || 'Documentation'} />
+-              <DonateButton ariaLabel={t('menu.donate') || 'Donate'} />
+               <ThemeCycleButton
+                 id="theme-cycle"
+                 isDark={isDark}
+@@ -459,7 +441,6 @@ export default function AppSidebar() {
+           </div>
+           <div className="drawer-header-actions">
+             <DocsButton ariaLabel={t('menu.docs') || 'Documentation'} />
+-            <DonateButton ariaLabel={t('menu.donate') || 'Donate'} />
+             <ThemeCycleButton
+               id="theme-cycle-drawer"
+               isDark={isDark}
+diff --git a/frontend/src/pages/api-docs/endpoints.ts b/frontend/src/pages/api-docs/endpoints.ts
+index b8cee966..846d16e4 100644
+--- a/frontend/src/pages/api-docs/endpoints.ts
++++ b/frontend/src/pages/api-docs/endpoints.ts
+@@ -236,13 +236,6 @@ export const sections: readonly Section[] = [
+           'Mint a CSRF token for the current session. The SPA replays it in the X-CSRF-Token header on unsafe requests. Bearer-token callers can skip this — the middleware short-circuits CSRF for authenticated API requests.',
+         response: '{\n  "success": true,\n  "obj": "csrf-token-string"\n}',
+       },
+-      {
+-        method: 'GET',
+-        path: '/sponsors',
+-        summary:
+-          'Public. Active paid sponsor placements read from the project sponsors.json (cached for 1h); entries outside their from/until window are dropped. Logos are proxied by the panel at /sponsors/logo/{name}. Used by the login page and panel sponsor slots.',
+-        responseSchema: 'SponsorList',
+-      },
+       {
+         method: 'POST',
+         path: '/getTwoFactorEnable',
+diff --git a/frontend/src/pages/index/IndexPage.tsx b/frontend/src/pages/index/IndexPage.tsx
+index c6d4fefb..c2457e2d 100644
+--- a/frontend/src/pages/index/IndexPage.tsx
++++ b/frontend/src/pages/index/IndexPage.tsx
+@@ -22,7 +22,6 @@ import { useStatusQuery } from '@/api/queries/useStatusQuery';
+ import { useMediaQuery } from '@/hooks/useMediaQuery';
+ import AppSidebar from '@/layouts/AppSidebar';
+ import { LazyMount } from '@/components/utility';
+-import SponsorSlot from '@/components/sponsor/SponsorSlot';
+ import { setMessageInstance } from '@/utils/messageBus';
+ import OverviewActionBar from './OverviewActionBar';
+ import VitalTile from './VitalTile';
+@@ -214,8 +213,6 @@ export default function IndexPage() {
+                     onOpenVersionSwitch={() => setVersionOpen(true)}
+                   />
+ 
+-                  <SponsorSlot slot="dashboard" />
+-
+                   {health && (
+                     <div className="ov-health" style={{ color: health.color }}>
+                       <span className="ov-health-mark" />
+diff --git a/frontend/src/pages/login/LoginPage.tsx b/frontend/src/pages/login/LoginPage.tsx
+index bc9b1c77..b6375f4b 100644
+--- a/frontend/src/pages/login/LoginPage.tsx
++++ b/frontend/src/pages/login/LoginPage.tsx
+@@ -26,7 +26,6 @@ import { FormProvider, useForm } from 'react-hook-form';
+ import { HttpUtil, LanguageManager } from '@/utils';
+ import { FormField, rhfZodValidate } from '@/components/form/rhf';
+ import { setMessageInstance } from '@/utils/messageBus';
+-import SponsorSlot from '@/components/sponsor/SponsorSlot';
+ import { pauseAnimationsUntilLeave, useTheme } from '@/hooks/useTheme';
+ import { LoginFormSchema, TwoFactorCodeSchema, type LoginFormValues } from '@/schemas/login';
+ import './LoginPage.css';
+@@ -254,7 +253,6 @@ export default function LoginPage() {
+                     </Form.Item>
+                   </Form>
+                 </FormProvider>
+-                <SponsorSlot slot="login" variant="compact" className="login-sponsor" />
+               </div>
+             )}
+           </div>
+diff --git a/frontend/src/routes/panelRoutes.tsx b/frontend/src/routes/panelRoutes.tsx
+index b003a11d..63ea3be8 100644
+--- a/frontend/src/routes/panelRoutes.tsx
++++ b/frontend/src/routes/panelRoutes.tsx
+@@ -3,7 +3,6 @@ import type { ComponentType } from 'react';
+ import {
+   ApiOutlined,
+   ClusterOutlined,
+-  CrownOutlined,
+   DashboardOutlined,
+   ExportOutlined,
+   GlobalOutlined,
+@@ -24,7 +23,6 @@ const HostsPage = lazy(() => import('@/pages/hosts/HostsPage'));
+ const SettingsPage = lazy(() => import('@/pages/settings/SettingsPage'));
+ const XrayPage = lazy(() => import('@/pages/xray/XrayPage'));
+ const ApiDocsPage = lazy(() => import('@/pages/api-docs/ApiDocsPage'));
+-const SponsorsPage = lazy(() => import('@/pages/sponsors/SponsorsPage'));
+ 
+ export interface PanelRoute {
+   path: string;
+@@ -47,7 +45,6 @@ export const PANEL_ROUTES: PanelRoute[] = [
+   { path: '/settings', titleKey: 'menu.settings', icon: SettingOutlined, component: SettingsPage },
+   { path: '/xray', titleKey: 'menu.xray', icon: ToolOutlined, component: XrayPage },
+   { path: '/api-docs', titleKey: 'menu.apiDocs', icon: ApiOutlined, component: ApiDocsPage },
+-  { path: '/sponsors', titleKey: 'menu.sponsors', icon: CrownOutlined, component: SponsorsPage },
+ ];
+ 
+ export const PANEL_ROUTE_PATHS = PANEL_ROUTES.map((route) => route.path);
+diff --git a/internal/web/controller/index.go b/internal/web/controller/index.go
+index 0433e2ed..70a78977 100644
+--- a/internal/web/controller/index.go
++++ b/internal/web/controller/index.go
+@@ -6,7 +6,6 @@ import (
+ 	"time"
+ 
+ 	"github.com/mhsanaei/3x-ui/v3/internal/logger"
+-	"github.com/mhsanaei/3x-ui/v3/internal/web/entity"
+ 	"github.com/mhsanaei/3x-ui/v3/internal/web/middleware"
+ 	"github.com/mhsanaei/3x-ui/v3/internal/web/service"
+ 	"github.com/mhsanaei/3x-ui/v3/internal/web/service/panel"
+@@ -44,36 +43,12 @@ func NewIndexController(g *gin.RouterGroup) *IndexController {
+ func (a *IndexController) initRouter(g *gin.RouterGroup) {
+ 	g.GET("/", a.index)
+ 	g.GET("/csrf-token", a.csrfToken)
+-	g.GET("/sponsors", a.sponsors)
+-	g.GET("/sponsors/logo/:name", a.sponsorLogo)
+ 
+ 	g.POST("/login", middleware.CSRFMiddleware(getRemoteIp), a.login)
+ 	g.POST("/logout", middleware.CSRFMiddleware(getRemoteIp), a.logout)
+ 	g.POST("/getTwoFactorEnable", middleware.CSRFMiddleware(getRemoteIp), a.getTwoFactorEnable)
+ }
+ 
+-// sponsors is public so the login page can render its slot; failures stay silent.
+-func (a *IndexController) sponsors(c *gin.Context) {
+-	list, err := a.panelService.GetSponsors()
+-	if err != nil {
+-		logger.Debug("sponsors fetch failed:", err)
+-		c.JSON(http.StatusOK, entity.Msg{Success: false})
+-		return
+-	}
+-	jsonObj(c, list, nil)
+-}
+-
+-func (a *IndexController) sponsorLogo(c *gin.Context) {
+-	data, contentType, err := a.panelService.GetSponsorLogo(c.Param("name"))
+-	if err != nil {
+-		logger.Debug("sponsor logo failed:", err)
+-		c.Status(http.StatusNotFound)
+-		return
+-	}
+-	c.Header("Cache-Control", "public, max-age=3600")
+-	c.Data(http.StatusOK, contentType, data)
+-}
+-
+ // index handles the root route, redirecting logged-in users to the panel or showing the login page.
+ func (a *IndexController) index(c *gin.Context) {
+ 	if session.IsLogin(c) {
+diff --git a/internal/web/routes_contract_test.go b/internal/web/routes_contract_test.go
+index dccdcb42..9db1a170 100644
+--- a/internal/web/routes_contract_test.go
++++ b/internal/web/routes_contract_test.go
+@@ -33,7 +33,6 @@ var contractExtraRoutes = map[string]bool{
+ 	"POST /login":              true,
+ 	"POST /logout":             true,
+ 	"GET /csrf-token":          true,
+-	"GET /sponsors":            true,
+ 	"POST /getTwoFactorEnable": true,
+ 	"GET /ws":                  true,
+ }
+diff --git a/tools/openapigen/main.go b/tools/openapigen/main.go
+index 3a551795..d1bfa99d 100644
+--- a/tools/openapigen/main.go
++++ b/tools/openapigen/main.go
+@@ -118,7 +118,7 @@ func run(root, outDir string) error {
+ 		},
+ 		{
+ 			Path:        resolveRel(root, "internal/web/service/panel"),
+-			StructAllow: setOf("ApiTokenView", "PanelUpdateStatus", "Sponsor", "SponsorList"),
++			StructAllow: setOf("ApiTokenView", "PanelUpdateStatus"),
+ 		},
+ 		{
+ 			Path:        resolveRel(root, "internal/web/controller"),
