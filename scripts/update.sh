@@ -78,6 +78,19 @@ _stop_xui_and_verify() {
     return 1
 }
 
+# Identify the Xray binary owned by this panel, not a different Xray service.
+_panel_xray_alive() {
+    local entry exe
+    for entry in /proc/[0-9]*/exe; do
+        [[ -e "${entry}" ]] || continue
+        exe="$(readlink -f "${entry}" 2>/dev/null || true)"
+        case "${exe}" in
+            "${xui_folder}/bin/xray-linux-"*|"${xui_folder}/bin/xray") return 0 ;;
+        esac
+    done
+    return 1
+}
+
 _trigger_auto_rollback() {
     local helper="${stage_dir}/helper-scripts/rollback.sh"
     [[ -n "${pre_upgrade_backup}" && -s "${pre_upgrade_backup}" &&
@@ -334,6 +347,8 @@ grep -q '^# CLEAN_SCRIPT_PROTOCOL=2$' "${stage_dir}/helper-scripts/rollback.sh" 
 # Step 2: Stop Service (Verified) & Create Verified Pre-Upgrade Backup
 # ------------------------------------------------------------------------------
 echo -e "${green}[2/6] Staging backup, stopping x-ui, and verifying SQLite snapshot...${plain}"
+had_xray_before=0
+_panel_xray_alive && had_xray_before=1
 old_ver="$("${xui_folder}/x-ui" -v 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
 [[ -n "${old_ver}" ]] || old_ver="unknown"
 
@@ -575,6 +590,9 @@ done
 
 if [[ "${healthy}" -ne 1 ]]; then
     _fail "ERROR: Post-upgrade health check failed (x-ui is not active or port ${existing_port} is not listening)."
+fi
+if (( had_xray_before == 1 )) && ! _panel_xray_alive; then
+    _fail "ERROR: Panel-managed Xray ran before the upgrade but did not restart."
 fi
 
 # Health check passed — disarm auto-rollback trap
