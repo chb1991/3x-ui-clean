@@ -271,7 +271,11 @@ else
         [[ -z "${target_tag}" ]] && _fail "ERROR: Could not resolve latest release tag from ${CLEAN_REPO}."
     fi
 
-    download_url="https://github.com/${CLEAN_REPO}/releases/download/${target_tag}/x-ui-linux-${TARGET_ARCH}.tar.gz"
+    # Download the fully versioned bundle containing the exact matching helper
+    # scripts. The upstream numeric Git tag may refer to an older commit; do not
+    # fetch rollback logic from the tag's raw source tree.
+    archive_file="${stage_dir}/3x-ui-clean-${target_tag}-linux-${TARGET_ARCH}-offline.tar.gz"
+    download_url="https://github.com/${CLEAN_REPO}/releases/download/${target_tag}/$(basename "${archive_file}")"
     sha_url="${download_url}.sha256"
     echo -e "${green}[1/6] Downloading 3X-UI Clean ${target_tag} (${TARGET_ARCH})...${plain}"
     curl -fL --retry 5 --retry-delay 3 --connect-timeout 15 -o "${archive_file}" "${download_url}" || _fail "ERROR: Failed to download ${download_url}"
@@ -287,7 +291,14 @@ else
         _fail "ERROR: SHA256 mismatch! Expected ${expected_sha}, got ${actual_sha}"
     fi
 
-    tar -C "${stage_dir}" -xzf "${archive_file}" || _fail "ERROR: Failed to extract downloaded archive."
+    tar -C "${stage_dir}" -xzf "${archive_file}" || _fail "ERROR: Failed to extract downloaded offline bundle."
+    inner_tar="$(find "${stage_dir}" -maxdepth 3 -type f -name "x-ui-linux-${TARGET_ARCH}.tar.gz" | head -n1 || true)"
+    [[ -n "${inner_tar}" && -f "${inner_tar}.sha256" ]] ||
+        _fail "ERROR: Downloaded bundle missing inner application archive and matching checksum"
+    (cd "$(dirname "${inner_tar}")" && sha256sum -c "$(basename "${inner_tar}.sha256")") ||
+        _fail "ERROR: Inner application checksum failed"
+    tar -C "${stage_dir}" -xzf "${inner_tar}" || _fail "ERROR: Failed to extract application archive"
+    bundled_scripts_dir="$(find "${stage_dir}" -maxdepth 2 -type d -name scripts | head -n1 || true)"
 fi
 
 [[ ! -s "${stage_dir}/x-ui/x-ui" ]] && _fail "ERROR: Staged archive is missing x-ui binary."
@@ -313,12 +324,7 @@ echo -e "${green}Staged binary verified: v${new_ver}${plain}"
 mkdir -p "${stage_dir}/helper-scripts"
 if [[ -n "${bundled_scripts_dir}" && -d "${bundled_scripts_dir}" ]]; then
     cp -f "${bundled_scripts_dir}/"*.sh "${stage_dir}/helper-scripts/" 2>/dev/null || true
-elif [[ -z "${offline_archive}" ]]; then
-    for sname in backup.sh rollback.sh update.sh install.sh; do
-        curl -fsSL --retry 3 --connect-timeout 10 \
-            "https://raw.githubusercontent.com/${CLEAN_REPO}/${target_tag}/scripts/${sname}" \
-            -o "${stage_dir}/helper-scripts/${sname}" || _fail "ERROR: Release helper ${sname} is missing"
-    done
+
 fi
 
 # Refuse known-vulnerable helper bundles before touching the live service.
