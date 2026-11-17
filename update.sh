@@ -539,24 +539,14 @@ else
             [[ -f "${stage_dir}/x-ui/x-ui.service.rhel" ]] && unit_src="${stage_dir}/x-ui/x-ui.service.rhel"
             ;;
     esac
-    if [[ -f "${unit_src}" ]]; then
+    # Pure ad-removal upgrade: preserve the production unit and all local
+    # sandbox/Cloudflare-related drop-ins. Opt in only when explicitly requested.
+    if [[ "${XUI_REPLACE_SYSTEMD:-0}" == "1" ]]; then
+        [[ -f "${unit_src}" ]] || _fail "ERROR: Requested systemd replacement but packaged unit is absent"
         cp -f "${unit_src}" "${xui_service}/x-ui.service"
     fi
-    dropin_dir="${xui_service}/x-ui.service.d"
-    mkdir -p "${dropin_dir}"
-    sys_ver="$(systemctl --version 2>/dev/null | awk 'NR == 1 {print $2}' | tr -cd '0-9' || true)"
-    {
-        echo "[Service]"
-        echo "ReadWritePaths=-${xui_db_folder} -${xui_folder} -${xui_log_folder} -${backup_root}"
-        echo "ReadWriteDirectories=-${xui_db_folder} -${xui_folder} -${xui_log_folder} -${backup_root}"
-        if [[ -n "${sys_ver}" && "${sys_ver}" -ge 239 ]]; then
-            echo "SystemCallFilter=@system-service"
-            echo "SystemCallErrorNumber=EPERM"
-        fi
-    } > "${dropin_dir}/10-xui-sandbox.conf"
-
+    # Default: do not rewrite 10-xui-sandbox.conf (or any administrator override).
     systemctl daemon-reload
-    systemctl enable x-ui >/dev/null 2>&1 || true
     systemctl start x-ui || _fail "ERROR: systemctl start x-ui failed!"
 fi
 
