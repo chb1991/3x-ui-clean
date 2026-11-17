@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # 3X-UI Clean — Atomic Rollback & Full Verification Script
+# CLEAN_SCRIPT_PROTOCOL=2
 # Repository: https://github.com/chb1991/3x-ui-clean
 # License: GPL-3.0
 # ==============================================================================
@@ -201,6 +202,15 @@ fi
 
 # Restore only after all archive checks are complete, never touch an active SQLite DB.
 [[ "${xui_folder}" == "/usr/local/x-ui" ]] || { log_err "Unexpected installation directory; refusing destructive restore"; exit 1; }
+command -v python3 >/dev/null 2>&1 || { log_err "python3 required for SQLite integrity validation"; exit 1; }
+python3 - "${stage_dir}/db/x-ui.db" <<'PY'
+import sqlite3,sys
+db=sqlite3.connect("file:"+sys.argv[1]+"?mode=ro", uri=True, timeout=15)
+try:
+    value=db.execute("PRAGMA integrity_check").fetchone()[0]
+    if value != "ok": raise RuntimeError("PRAGMA integrity_check: "+str(value))
+finally: db.close()
+PY
 _stop_xui_and_verify
 
 # 1. Restore database folder (/etc/x-ui) unless --binary-only
