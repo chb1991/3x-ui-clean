@@ -96,12 +96,11 @@ if [[ -f "${xui_db_folder}/x-ui.db" && -f "${xui_folder}/x-ui" && "${force_fresh
             _fail "ERROR: Bundled updater is obsolete; refusing an unsafe in-place upgrade."
         exec bash "${script_dir}/update.sh" "${orig_args[@]}"
     fi
-    if [[ -z "${target_tag}" ]]; then
-        target_tag="$(curl -fsSL --retry 3 "https://api.github.com/repos/${CLEAN_REPO}/releases/latest" | grep '"tag_name":' | sed -E 's/.*"tag_name": "([^"]+)".*/\1/' | head -1)"
-    fi
-    [[ "${target_tag}" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]] || _fail "ERROR: Could not resolve a stable Release tag"
+    # Download only the updater entrypoint from the reviewed main branch.
+    # It fetches the current Release offline bundle including matching rollback helpers.
+    # This avoids using outdated raw scripts from the original upstream numeric tag.
     tmp_up="$(mktemp "${staging_root}/x-ui-clean-update-XXXXXXXX.sh")"
-    if ! curl -fsSL --retry 3 "https://raw.githubusercontent.com/${CLEAN_REPO}/${target_tag}/scripts/update.sh" -o "${tmp_up}" || [[ ! -s "${tmp_up}" ]]; then
+    if ! curl -fsSL --retry 3 "https://raw.githubusercontent.com/${CLEAN_REPO}/main/scripts/update.sh" -o "${tmp_up}" || [[ ! -s "${tmp_up}" ]]; then
         rm -f "${tmp_up}"
         _fail "ERROR: Unable to download release-pinned update.sh"
     fi
