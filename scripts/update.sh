@@ -4,7 +4,7 @@
 # Repository: https://github.com/chb1991/3x-ui-clean
 # License: GPL-3.0
 # ==============================================================================
-set -euo pipefail
+set -Eeuo pipefail
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -24,6 +24,7 @@ xui_db_folder="${XUI_DB_FOLDER:-/etc/x-ui}"
 xui_service="${XUI_SERVICE:-/etc/systemd/system}"
 xui_log_folder="${XUI_LOG_FOLDER:-/var/log/x-ui}"
 backup_root="${XUI_BACKUP_DIR:-/var/backups/x-ui}"
+staging_root="${XUI_STAGING_DIR:-/var/tmp}"
 
 # ------------------------------------------------------------------------------
 # Web Panel Updater Status Contract (compatible with internal/web/service/panel/panel.go)
@@ -48,33 +49,31 @@ stage_dir=""
 bkp_stage=""
 pre_upgrade_backup=""
 rollback_needed=0
+service_stopped_by_us=0
 existing_port=""
 
 _is_xui_running() {
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet x-ui 2>/dev/null; then
         return 0
     fi
-    if pgrep -f "${xui_folder}/x-ui" >/dev/null 2>&1; then
+    if pgrep -x x-ui >/dev/null 2>&1; then
         return 0
     fi
     return 1
 }
 
 _stop_xui_and_verify() {
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl stop x-ui >/dev/null 2>&1 || true
-    elif command -v rc-service >/dev/null 2>&1; then
-        rc-service x-ui stop >/dev/null 2>&1 || true
-    fi
-    pkill -f 'mtg-linux-[^ ]* run ' >/dev/null 2>&1 || true
-
+    # Never copy or replace a live SQLite database if stopping systemd failed.
+    systemctl stop x-ui >/dev/null 2>&1 || {
+        echo "[ERROR] Failed to stop x-ui.service" >&2
+        return 1
+    }
     local i
-    for i in {1..15}; do
-        if ! _is_xui_running; then
-            return 0
-        fi
+    for i in {1..20}; do
+        if ! _is_xui_running; then return 0; fi
         sleep 1
     done
+    echo "[ERROR] x-ui process remains alive after systemctl stop" >&2
     return 1
 }
 
@@ -88,7 +87,7 @@ _trigger_auto_rollback() {
     _stop_xui_and_verify || true
 
     local rb_stage
-    rb_stage="$(mktemp -d "/tmp/x-ui-autorollback-XXXXXX")"
+    rb_stage="$(mktemp -d "${staging_root}/x-ui-autorollback-XXXXXX")"
     if tar -C "${rb_stage}" -xzf "${pre_upgrade_backup}" 2>/dev/null; then
         local DB_SHA256="" BIN_SHA256=""
         if [[ -f "${rb_stage}/backup-meta.env" ]]; then
@@ -275,7 +274,10 @@ fi
 # ------------------------------------------------------------------------------
 # Step 1: Pre-Stage & Validate New Release Archive (Before Stopping Service!)
 # ------------------------------------------------------------------------------
-stage_dir="$(mktemp -d "/tmp/x-ui-update-stage-XXXXXX")"
+install -d -m 700 "${staging_root}"
+free_kib="$(df -Pk "${staging_root}" | awk 'NR == 2 {print $4}')"
+[[ "${free_kib}" =~ ^[0-9]+$ && "${free_kib}" -ge 786432 ]] || _fail "ERROR: Need at least 768 MiB free space under ${staging_root}; /tmp is tmpfs on small VPS."
+stage_dir="$(mktemp -d "${staging_root}/x-ui-update-stage-XXXXXX")"
 archive_file="${stage_dir}/x-ui-linux-${TARGET_ARCH}.tar.gz"
 bundled_scripts_dir=""
 
@@ -283,16 +285,14 @@ if [[ -n "${offline_archive}" ]]; then
     [[ ! -f "${offline_archive}" ]] && _fail "ERROR: Offline archive not found: ${offline_archive}"
     offline_abs="$(readlink -f "${offline_archive}")"
     echo -e "${green}[1/6] Validating offline archive: ${offline_abs}${plain}"
-    if [[ -f "${offline_abs}.sha256" ]]; then
-        (cd "$(dirname "${offline_abs}")" && sha256sum -c "$(basename "${offline_abs}.sha256")") || _fail "ERROR: Offline archive SHA256 mismatch!"
-    fi
+    [[ -f "${offline_abs}.sha256" ]] || _fail "ERROR: Missing offline .sha256 sidecar; verify the Release checksum before upgrading."
+    (cd "$(dirname "${offline_abs}")" && sha256sum -c "$(basename "${offline_abs}.sha256")") || _fail "ERROR: Offline archive SHA256 mismatch!"
     tar -C "${stage_dir}" -xzf "${offline_abs}" || _fail "ERROR: Failed to extract offline archive."
     if [[ ! -f "${stage_dir}/x-ui/x-ui" ]]; then
         inner_tar="$(find "${stage_dir}" -type f -name "x-ui-linux-${TARGET_ARCH}.tar.gz" | head -n1 || true)"
         [[ -z "${inner_tar}" ]] && _fail "ERROR: Offline archive does not contain x-ui/ or x-ui-linux-${TARGET_ARCH}.tar.gz"
-        if [[ -f "${inner_tar}.sha256" ]]; then
-            (cd "$(dirname "${inner_tar}")" && sha256sum -c "$(basename "${inner_tar}.sha256")") || _fail "ERROR: Inner archive SHA256 mismatch!"
-        fi
+        [[ -f "${inner_tar}.sha256" ]] || _fail "ERROR: Missing inner archive .sha256"
+        (cd "$(dirname "${inner_tar}")" && sha256sum -c "$(basename "${inner_tar}.sha256")") || _fail "ERROR: Inner archive SHA256 mismatch!"
         tar -C "${stage_dir}" -xzf "${inner_tar}" || _fail "ERROR: Failed to extract inner x-ui archive."
     fi
     bundled_scripts_dir="$(find "${stage_dir}" -maxdepth 2 -type d -name "scripts" | head -n1 || true)"
@@ -387,6 +387,7 @@ if [[ -d "${xui_service}/x-ui.service.d" ]]; then
 fi
 
 # Now stop x-ui and strictly verify it is no longer running
+service_stopped_by_us=1
 if ! _stop_xui_and_verify; then
     _fail "ERROR: Failed to stop x-ui service cleanly within 15s! Refusing to proceed while process is active."
 fi
@@ -474,6 +475,7 @@ fi
 
 for item in "${stage_dir}/x-ui/bin/"*; do
     [[ -e "${item}" ]] || continue
+    [[ "$(basename "${item}")" == "config.json" ]] && continue
     cp -rf "${item}" "${xui_folder}/bin/"
 done
 chmod +x "${xui_folder}"/bin/xray-linux-* "${xui_folder}"/bin/mtg-linux-* 2>/dev/null || true
