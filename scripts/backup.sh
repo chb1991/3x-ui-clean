@@ -110,7 +110,7 @@ _is_xui_running() {
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet x-ui 2>/dev/null; then
         return 0
     fi
-    if pgrep -f "${xui_folder}/x-ui" >/dev/null 2>&1; then
+    if pgrep -x x-ui >/dev/null 2>&1; then
         return 0
     fi
     return 1
@@ -118,21 +118,13 @@ _is_xui_running() {
 
 _stop_xui_and_verify() {
     log_info "Stopping x-ui service and verifying process termination..."
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl stop x-ui 2>/dev/null || true
-    elif command -v rc-service >/dev/null 2>&1; then
-        rc-service x-ui stop 2>/dev/null || true
-    fi
-
+    systemctl stop x-ui || { log_err "systemctl stop x-ui failed"; return 1; }
     local i
-    for i in {1..15}; do
-        if ! _is_xui_running; then
-            return 0
-        fi
+    for i in {1..20}; do
+        ! _is_xui_running && return 0
         sleep 1
     done
-
-    log_err "Failed to stop x-ui service after 15 seconds; process is still active. Refusing to take an inconsistent backup."
+    log_err "x-ui remains active; refusing inconsistent database copy"
     return 1
 }
 
@@ -195,7 +187,7 @@ if [[ -d "${xui_service}/x-ui.service.d" ]]; then
     cp -a "${xui_service}/x-ui.service.d/." "${stage_dir}/system/x-ui.service.d/"
 fi
 if [[ -f /etc/init.d/x-ui ]]; then
-    cp -a "${stage_dir}/system/x-ui.initd" /etc/init.d/x-ui 2>/dev/null || cp -a /etc/init.d/x-ui "${stage_dir}/system/x-ui.initd"
+    cp -a /etc/init.d/x-ui "${stage_dir}/system/x-ui.initd"
 fi
 
 # 2. Back up database folder (/etc/x-ui) with strict WAL consistency
@@ -217,43 +209,64 @@ if [[ -d "${xui_db_folder}" ]]; then
     if [[ -f "${xui_db_folder}/x-ui.db" ]]; then
         online_backup_ok=0
         if [[ "${stop_service}" -eq 0 && "${was_active}" -eq 1 ]]; then
-            if command -v sqlite3 >/dev/null 2>&1; then
-                log_info "Running SQLite online backup API (.backup) with integrity verification..."
-                if sqlite3 -cmd ".timeout 10000" "${xui_db_folder}/x-ui.db" ".backup '${stage_dir}/db/x-ui.db'" 2>/dev/null; then
-                    integrity="$(sqlite3 "${stage_dir}/db/x-ui.db" "PRAGMA integrity_check;" 2>/dev/null | head -n1 || true)"
-                    if [[ "${integrity}" == "ok" && -s "${stage_dir}/db/x-ui.db" ]]; then
-                        online_backup_ok=1
-                    else
-                        log_warn "SQLite online backup integrity check returned '${integrity}'; falling back to brief service stop."
-                        rm -f "${stage_dir}/db/x-ui.db"
-                    fi
-                else
-                    log_warn "sqlite3 .backup command failed; falling back to brief service stop."
-                    rm -f "${stage_dir}/db/x-ui.db"
+            log_info "Creating SQLite online consistent snapshot without stopping node traffic..."
+            if command -v python3 >/dev/null 2>&1; then
+                if python3 - "${xui_db_folder}/x-ui.db" "${stage_dir}/db/x-ui.db" <<'PY'
+import os, sqlite3, sys
+source = sqlite3.connect("file:" + sys.argv[1] + "?mode=ro", uri=True, timeout=60)
+target = sqlite3.connect(sys.argv[2])
+try:
+    source.backup(target, pages=256, sleep=0.1)
+    result = target.execute("PRAGMA integrity_check").fetchone()
+    if result != ("ok",):
+        raise RuntimeError("SQLite integrity_check failed: " + str(result))
+finally:
+    target.close()
+    source.close()
+os.chmod(sys.argv[2], 0o600)
+PY
+                then
+                    online_backup_ok=1
                 fi
-            else
-                log_warn "sqlite3 CLI not installed; falling back to brief service stop for WAL-safe cold backup."
+            elif command -v sqlite3 >/dev/null 2>&1; then
+                if sqlite3 -cmd ".timeout 10000" "${xui_db_folder}/x-ui.db" ".backup '${stage_dir}/db/x-ui.db'" && \
+                   [[ "$(sqlite3 "${stage_dir}/db/x-ui.db" 'PRAGMA integrity_check;')" == "ok" ]]; then
+                    online_backup_ok=1
+                fi
             fi
-
-            if [[ "${online_backup_ok}" -eq 0 ]]; then
-                stop_service=1
-                restart_after=1
+            if [[ "${online_backup_ok}" -ne 1 ]]; then
+                rm -f -- "${stage_dir}/db/x-ui.db"
+                log_err "Online SQLite backup failed. Refusing unexpected stop of active VLESS/REALITY nodes. Run with --stop-service --restart-after only in a maintenance window."
+                exit 1
             fi
         fi
 
         if [[ "${online_backup_ok}" -eq 0 ]]; then
             if _is_xui_running; then
-                _stop_xui_and_verify
+                [[ "${stop_service}" -eq 1 ]] || { log_err "Unrequested service stop forbidden"; exit 1; }
                 service_stopped_by_us=1
+                _stop_xui_and_verify
             fi
+            # Cold DB + matching WAL files must be copied only after the writer has stopped.
             cp -a "${xui_db_folder}/x-ui.db" "${stage_dir}/db/x-ui.db"
             [[ -f "${xui_db_folder}/x-ui.db-wal" ]] && cp -a "${xui_db_folder}/x-ui.db-wal" "${stage_dir}/db/x-ui.db-wal"
             [[ -f "${xui_db_folder}/x-ui.db-shm" ]] && cp -a "${xui_db_folder}/x-ui.db-shm" "${stage_dir}/db/x-ui.db-shm"
-
             src_sha="$(sha256sum "${xui_db_folder}/x-ui.db" | awk '{print $1}')"
             dst_sha="$(sha256sum "${stage_dir}/db/x-ui.db" | awk '{print $1}')"
-            if [[ -z "${src_sha}" || "${src_sha}" != "${dst_sha}" ]]; then
-                log_err "Database copy SHA256 mismatch (${src_sha} != ${dst_sha})!"
+            [[ "${src_sha}" == "${dst_sha}" ]] || { log_err "Cold database copy failed checksum comparison"; exit 1; }
+            if command -v python3 >/dev/null 2>&1; then
+                python3 - "${stage_dir}/db/x-ui.db" <<'PY'
+import sqlite3,sys
+db=sqlite3.connect("file:"+sys.argv[1]+"?mode=ro", uri=True)
+try:
+    result=db.execute("PRAGMA integrity_check").fetchone()
+    if result!=("ok",): raise RuntimeError(str(result))
+finally: db.close()
+PY
+            elif command -v sqlite3 >/dev/null 2>&1; then
+                [[ "$(sqlite3 "${stage_dir}/db/x-ui.db" 'PRAGMA integrity_check;')" == "ok" ]] || { log_err "Cold backup SQLite integrity failed"; exit 1; }
+            else
+                log_err "Cannot validate SQLite snapshot; python3/sqlite3 not available"
                 exit 1
             fi
         fi
