@@ -6,7 +6,7 @@ on:
       - 'scripts/**'
       - 'install.sh'
       - 'update.sh'
-      - 'tests/maintenance-smoke.sh'
+      - 'tests/**'
       - '.github/workflows/safety-maintenance.yml'
   workflow_dispatch:
 
@@ -33,6 +33,14 @@ jobs:
           cmp scripts/update.sh update.sh
       - name: Exercise online WAL backup and failure guards (sandboxed fake service)
         run: sudo -E bash tests/maintenance-smoke.sh
+      - name: Debian 13 isolated migration-failure rollback exercise
+        run: |
+          set -euo pipefail
+          docker run --rm -v "${PWD}:/work:ro" -w /work debian:trixie bash -ec '
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 procps util-linux iproute2 >/dev/null
+            bash tests/debian13-migration-failure.sh
+          '
       - name: Check fail-closed safety contracts
         run: |
           set -euo pipefail
