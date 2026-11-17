@@ -14,6 +14,9 @@ jobs:
   verify-patch:
     name: Verify Patch on Upstream (${{ matrix.target }})
     runs-on: ubuntu-latest
+    # Upstream main is a preview. Its patch incompatibility must remain visible
+    # but cannot veto a release validated against the latest stable tag.
+    continue-on-error: ${{ matrix.target == 'main' }}
     strategy:
       fail-fast: false
       matrix:
@@ -32,7 +35,8 @@ jobs:
             REF="main"
           fi
           echo "Testing against upstream ref: ${REF}"
-          git clone --branch "${REF}" --depth 1 https://github.com/MHSanaei/3x-ui.git upstream-src
+          # Filter blobs, but retain history needed by git apply --3way.
+          git clone --branch "${REF}" --filter=blob:none https://github.com/MHSanaei/3x-ui.git upstream-src
 
       - name: Run apply-clean.sh & Semantic Guard
         run: |
@@ -61,3 +65,7 @@ jobs:
           npm run build
           cd ..
           go test -v ./internal/web -run TestRoutesContract
+          go test ./internal/util/version/...
+          # Confirm a real Go executable can be produced from the patched source.
+          go build -o /tmp/x-ui-clean-qualification .
+          /tmp/x-ui-clean-qualification -v
