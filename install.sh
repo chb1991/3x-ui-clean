@@ -99,14 +99,15 @@ if [[ -f "${xui_db_folder}/x-ui.db" && -f "${xui_folder}/x-ui" && "${force_fresh
     # Download only the updater entrypoint from the reviewed main branch.
     # It fetches the current Release offline bundle including matching rollback helpers.
     # This avoids using outdated raw scripts from the original upstream numeric tag.
+    install -d -m 700 "${staging_root}"
     tmp_up="$(mktemp "${staging_root}/x-ui-clean-update-XXXXXXXX.sh")"
     if ! curl -fsSL --retry 3 "https://raw.githubusercontent.com/${CLEAN_REPO}/main/scripts/update.sh" -o "${tmp_up}" || [[ ! -s "${tmp_up}" ]]; then
         rm -f "${tmp_up}"
-        _fail "ERROR: Unable to download release-pinned update.sh"
+        _fail "ERROR: Unable to download the reviewed main-branch update.sh"
     fi
     if ! grep -q '^# CLEAN_SCRIPT_PROTOCOL=2$' "${tmp_up}"; then
         rm -f "${tmp_up}"
-        _fail "ERROR: Release tag contains an outdated updater. Build and publish verified scripts first."
+        _fail "ERROR: Downloaded updater lacks reviewed safety protocol; refusing to run."
     fi
     if bash "${tmp_up}" "${orig_args[@]}"; then
         rc=0
