@@ -355,40 +355,53 @@ jobs:
           sha256sum *.tar.gz > SHA256SUMS.txt
           cd ..
 
-          # Update CHANGELOG-CLEAN.md
-          {
-            echo "## ${TAG} (${BUILD_DATE})"
-            echo ""
-            echo "- **Upstream Release**: [\`MHSanaei/3x-ui@${TAG}\`](https://github.com/MHSanaei/3x-ui/releases/tag/${TAG})"
-            echo "- **Upstream Commit**: \`${UPSTREAM_SHA}\`"
-            echo "- **License**: GNU GPL v3.0"
-            echo "- **Modifications Applied**:"
-            echo "  - Removed sponsor/ad backend service (\`internal/web/service/panel/sponsor.go\`) and outbound requests to \`MHSanaei/sponsors\`."
-            echo "  - Removed \`/sponsors\` and \`/sponsors/logo/:name\` public endpoints from \`internal/web/controller/index.go\`."
-            echo "  - Removed frontend sponsor slots (\`LoginPage.tsx\`, \`IndexPage.tsx\`), \`/sponsors\` route & menu entry (\`panelRoutes.tsx\`), and sidebar Donate link (\`AppSidebar.tsx\`)."
-            echo "  - Redirected in-panel & CLI self-updater (\`panel.go\`, \`x-ui.sh\`, \`update.sh\`, \`install.sh\`) to \`${GITHUB_REPOSITORY}\`."
-            echo ""
-            echo "### SHA256 Checksums"
-            echo '```text'
-            cat release-assets/SHA256SUMS.txt
-            echo '```'
-            echo ""
-            if [[ -f CHANGELOG-CLEAN.md ]]; then
-              cat CHANGELOG-CLEAN.md
-            fi
-          } > CHANGELOG-CLEAN.md.new
-          mv -f CHANGELOG-CLEAN.md.new CHANGELOG-CLEAN.md
+          # Update CHANGELOG-CLEAN.md only if this tag section isn't already recorded with checksums
+          if ! grep -q "^## ${TAG} (" CHANGELOG-CLEAN.md 2>/dev/null; then
+            {
+              echo "## ${TAG} (${BUILD_DATE})"
+              echo ""
+              echo "- **Upstream Release**: [\`MHSanaei/3x-ui@${TAG}\`](https://github.com/MHSanaei/3x-ui/releases/tag/${TAG})"
+              echo "- **Upstream Commit**: \`${UPSTREAM_SHA}\`"
+              echo "- **License**: GNU GPL v3.0"
+              echo "- **Modifications Applied**:"
+              echo "  - Removed sponsor/ad backend service (\`internal/web/service/panel/sponsor.go\`) and outbound requests to \`MHSanaei/sponsors\`."
+              echo "  - Removed \`/sponsors\` and \`/sponsors/logo/:name\` public endpoints from \`internal/web/controller/index.go\`."
+              echo "  - Removed frontend sponsor slots (\`LoginPage.tsx\`, \`IndexPage.tsx\`), \`/sponsors\` route & menu entry (\`panelRoutes.tsx\`), and sidebar Donate link (\`AppSidebar.tsx\`)."
+              echo "  - Redirected in-panel & CLI self-updater (\`panel.go\`, \`x-ui.sh\`, \`update.sh\`, \`install.sh\`) to \`${GITHUB_REPOSITORY}\`."
+              echo ""
+              echo "### SHA256 Checksums"
+              echo '```text'
+              cat release-assets/SHA256SUMS.txt
+              echo '```'
+              echo ""
+              if [[ -f CHANGELOG-CLEAN.md ]]; then
+                cat CHANGELOG-CLEAN.md
+              fi
+            } > CHANGELOG-CLEAN.md.new
+            mv -f CHANGELOG-CLEAN.md.new CHANGELOG-CLEAN.md
+          fi
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          retry() {
+            for i in 1 2 3 4 5; do
+              "$@" && return 0
+              echo "Attempt $i failed: $* — retrying in $((i * 3))s..." >&2
+              sleep $((i * 3))
+            done
+            return 1
+          }
+
           git add UPSTREAM_VERSION CHANGELOG-CLEAN.md x-ui.sh x-ui.service.* x-ui.rc
           if ! git diff --cached --quiet; then
             git commit -m "chore(release): sync upstream ${TAG} (${UPSTREAM_SHA::8})"
-            git push origin HEAD:main
+            retry git push origin HEAD:main
+            # Allow GitHub git replicas to index the new commit before tagging/releasing
+            sleep 3
           fi
 
-          git tag -f "${TAG}"
-          git push -f origin "refs/tags/${TAG}"
+          TARGET_SHA="$(git rev-parse HEAD)"
 
           NOTES_FILE="$(mktemp)"
           {
@@ -408,14 +421,14 @@ jobs:
           } > "${NOTES_FILE}"
 
           if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            gh release edit "${TAG}" --latest=true --prerelease=false \
+            retry gh release edit "${TAG}" --latest=true --prerelease=false \
               --title "3X-UI Clean ${TAG}" --notes-file "${NOTES_FILE}"
           else
-            gh release create "${TAG}" --latest=true --prerelease=false \
-              --target main --title "3X-UI Clean ${TAG}" --notes-file "${NOTES_FILE}"
+            retry gh release create "${TAG}" --latest=true --prerelease=false \
+              --target "${TARGET_SHA}" --title "3X-UI Clean ${TAG}" --notes-file "${NOTES_FILE}"
           fi
 
-          gh release upload "${TAG}" \
+          retry gh release upload "${TAG}" \
             release-assets/*.tar.gz \
             release-assets/*.sha256 \
             release-assets/SHA256SUMS.txt \
