@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 3X-UI Clean — Atomic Rollback & Recovery Script
+# 3X-UI Clean — Atomic Rollback & Full Verification Script
 # Repository: https://github.com/chb1991/3x-ui-clean
 # License: GPL-3.0
 # ==============================================================================
@@ -19,6 +19,7 @@ backup_root="${XUI_BACKUP_DIR:-/var/backups/x-ui}"
 target_archive=""
 auto_mode=0
 skip_db=0
+no_lock=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -40,6 +41,10 @@ while [[ $# -gt 0 ]]; do
             skip_db=1
             shift
             ;;
+        --no-lock)
+            no_lock=1
+            shift
+            ;;
         -h|--help)
             cat <<EOF
 Usage: $(basename "$0") [OPTIONS]
@@ -49,6 +54,7 @@ Options:
   --file, -f <path>     Restore from a specific backup .tar.gz archive
   --auto [path]         Non-interactive rollback (used by update.sh on failure)
   --binary-only         Restore only /usr/local/x-ui and service units, keeping current /etc/x-ui/x-ui.db
+  --no-lock             Skip acquiring mutex lock (when called by parent holding lock)
 EOF
             exit 0
             ;;
@@ -67,6 +73,51 @@ if [[ "${EUID}" -ne 0 ]]; then
     log_err "Please run rollback.sh as root."
     exit 1
 fi
+
+# ------------------------------------------------------------------------------
+# Process Mutex Lock
+# ------------------------------------------------------------------------------
+if [[ "${no_lock}" -eq 0 ]]; then
+    LOCK_DIR="/run/lock"
+    [[ -d "${LOCK_DIR}" ]] || LOCK_DIR="/tmp"
+    LOCK_FILE="${LOCK_DIR}/x-ui-clean-ops.lock"
+    exec 9>"${LOCK_FILE}"
+    if ! flock -n 9; then
+        log_err "Another 3X-UI operation (install/update/backup/rollback) is currently running (lock: ${LOCK_FILE})."
+        exit 1
+    fi
+fi
+
+_is_xui_running() {
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet x-ui 2>/dev/null; then
+        return 0
+    fi
+    if pgrep -f "${xui_folder}/x-ui" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+_stop_xui_and_verify() {
+    log_info "Stopping x-ui service and sidecars..."
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop x-ui 2>/dev/null || true
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service x-ui stop 2>/dev/null || true
+    fi
+    pkill -f 'mtg-linux-[^ ]* run ' 2>/dev/null || true
+
+    local i
+    for i in {1..15}; do
+        if ! _is_xui_running; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    log_err "Failed to stop x-ui cleanly after 15s; refusing to overwrite database while process is active."
+    return 1
+}
 
 # Interactive selection if no archive was specified
 if [[ -z "${target_archive}" ]]; then
@@ -114,11 +165,23 @@ if [[ -f "${target_archive}.sha256" ]]; then
     fi
 fi
 
+# Verify archive stream before extracting
+if ! tar -tzf "${target_archive}" >/dev/null 2>&1; then
+    log_err "Archive ${target_archive} is corrupted (tar -tzf failed)! Aborting rollback."
+    exit 1
+fi
+
 stage_dir="$(mktemp -d "/tmp/x-ui-rollback-XXXXXX")"
 trap 'rm -rf "${stage_dir}"' EXIT
 
 log_info "Extracting backup archive $(basename "${target_archive}")..."
 tar -C "${stage_dir}" -xzf "${target_archive}"
+
+PANEL_VERSION=""
+PANEL_PORT=""
+BACKUP_CREATED_UTC=""
+DB_SHA256=""
+BIN_SHA256=""
 
 if [[ -f "${stage_dir}/backup-meta.env" ]]; then
     # shellcheck disable=SC1090
@@ -134,9 +197,8 @@ if [[ "${auto_mode}" -eq 0 ]]; then
     fi
 fi
 
-log_info "Stopping x-ui service and sidecars..."
-systemctl stop x-ui 2>/dev/null || rc-service x-ui stop 2>/dev/null || true
-pkill -f 'mtg-linux-[^ ]* run ' 2>/dev/null || true
+# Stop x-ui and verify termination before restoring files
+_stop_xui_and_verify
 
 # 1. Restore database folder (/etc/x-ui) unless --binary-only
 if [[ "${skip_db}" -eq 0 && -d "${stage_dir}/db" ]]; then
@@ -146,6 +208,26 @@ if [[ "${skip_db}" -eq 0 && -d "${stage_dir}/db" ]]; then
     rm -f "${xui_db_folder}/x-ui.db-wal" "${xui_db_folder}/x-ui.db-shm"
     cp -a "${stage_dir}/db/." "${xui_db_folder}/"
     chmod 600 "${xui_db_folder}/x-ui.db" 2>/dev/null || true
+
+    # Verify restored DB hash and SQLite integrity
+    if [[ -f "${xui_db_folder}/x-ui.db" ]]; then
+        if [[ -n "${DB_SHA256}" ]]; then
+            restored_db_sha="$(sha256sum "${xui_db_folder}/x-ui.db" | awk '{print $1}')"
+            if [[ "${restored_db_sha}" != "${DB_SHA256}" ]]; then
+                log_err "Restored database SHA256 mismatch (expected ${DB_SHA256}, got ${restored_db_sha})!"
+                exit 1
+            fi
+            log_info "Database SHA256 verified (${restored_db_sha::16}...)."
+        fi
+        if command -v sqlite3 >/dev/null 2>&1; then
+            db_integrity="$(sqlite3 "${xui_db_folder}/x-ui.db" "PRAGMA integrity_check;" 2>/dev/null | head -n1 || true)"
+            if [[ "${db_integrity}" != "ok" ]]; then
+                log_err "Restored SQLite database failed PRAGMA integrity_check: ${db_integrity}"
+                exit 1
+            fi
+            log_info "SQLite PRAGMA integrity_check: ok"
+        fi
+    fi
 fi
 
 # 2. Restore main folder (/usr/local/x-ui)
@@ -157,6 +239,15 @@ if [[ -d "${stage_dir}/main" ]]; then
     chmod +x "${xui_folder}/x-ui" "${xui_folder}/x-ui.sh" 2>/dev/null || true
     chmod +x "${xui_folder}"/bin/xray-linux-* "${xui_folder}"/bin/mtg-linux-* 2>/dev/null || true
     chown -R root:root "${xui_folder}" 2>/dev/null || true
+
+    if [[ -n "${BIN_SHA256}" && -f "${xui_folder}/x-ui" ]]; then
+        restored_bin_sha="$(sha256sum "${xui_folder}/x-ui" | awk '{print $1}')"
+        if [[ "${restored_bin_sha}" != "${BIN_SHA256}" ]]; then
+            log_err "Restored x-ui binary SHA256 mismatch (expected ${BIN_SHA256}, got ${restored_bin_sha})!"
+            exit 1
+        fi
+        log_info "Binary SHA256 verified (${restored_bin_sha::16}...)."
+    fi
 fi
 
 # 3. Restore CLI script and systemd service unit
@@ -179,18 +270,51 @@ if [[ -f "${stage_dir}/system/x-ui.initd" ]]; then
     chmod +x /etc/init.d/x-ui
 fi
 
+# 4. Verify restored binary can read restored database settings
+check_port="${PANEL_PORT}"
+if [[ -x "${xui_folder}/x-ui" ]]; then
+    settings_check="$("${xui_folder}/x-ui" setting -show true 2>/dev/null || true)"
+    if [[ -z "${settings_check}" ]]; then
+        log_err "Restored x-ui binary failed to read settings from ${xui_db_folder}/x-ui.db!"
+        exit 1
+    fi
+    if [[ -z "${check_port}" ]]; then
+        check_port="$(echo "${settings_check}" | grep -Eo 'port: .+' | awk '{print $2}' | head -n1 || true)"
+    fi
+fi
+
+# 5. Start service and verify both systemd status and listening port
 log_info "Reloading service manager and starting x-ui..."
 if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload 2>/dev/null || true
     systemctl enable x-ui 2>/dev/null || true
     systemctl start x-ui
-    sleep 2
-    if systemctl is-active --quiet x-ui; then
-        log_info "Rollback succeeded! x-ui service is active and running."
-    else
-        log_err "x-ui service failed to start after rollback. Check: journalctl -u x-ui -n 50"
-        exit 1
-    fi
 else
     rc-service x-ui restart
 fi
+
+healthy=0
+for _ in 1 2 3 4 5; do
+    sleep 2
+    if command -v systemctl >/dev/null 2>&1; then
+        if ! systemctl is-active --quiet x-ui; then
+            continue
+        fi
+    fi
+    if [[ -n "${check_port}" ]] && command -v ss >/dev/null 2>&1; then
+        if ss -tln 2>/dev/null | grep -qE ":${check_port}\\b"; then
+            healthy=1
+            break
+        fi
+    else
+        healthy=1
+        break
+    fi
+done
+
+if [[ "${healthy}" -ne 1 ]]; then
+    log_err "Rollback health check failed: x-ui service is not active or port ${check_port:-unknown} is not listening! Check: journalctl -u x-ui -n 50"
+    exit 1
+fi
+
+log_info "Rollback succeeded! Database, binaries, and panel service (port ${check_port:-ok}) are fully verified."

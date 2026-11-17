@@ -96,8 +96,28 @@ if [[ -f "${xui_db_folder}/x-ui.db" && -f "${xui_folder}/x-ui" && "${force_fresh
     elif [[ -f "./update.sh" ]]; then
         exec bash "./update.sh" "${orig_args[@]}"
     else
-        exec bash <(curl -fsSL "https://raw.githubusercontent.com/${CLEAN_REPO}/main/scripts/update.sh") "${orig_args[@]}"
+        tmp_up="$(mktemp "/tmp/x-ui-clean-update-XXXXXX.sh")"
+        if ! curl -fsSL --retry 3 --connect-timeout 15 "https://raw.githubusercontent.com/${CLEAN_REPO}/main/scripts/update.sh" -o "${tmp_up}" || [[ ! -s "${tmp_up}" ]]; then
+            rm -f "${tmp_up}"
+            _fail "ERROR: Failed to download update.sh from ${CLEAN_REPO}."
+        fi
+        chmod +x "${tmp_up}"
+        bash "${tmp_up}" "${orig_args[@]}"
+        rc=$?
+        rm -f "${tmp_up}"
+        exit "${rc}"
     fi
+fi
+
+# ------------------------------------------------------------------------------
+# Process Mutex Lock (for fresh installation flow)
+# ------------------------------------------------------------------------------
+LOCK_DIR="/run/lock"
+[[ -d "${LOCK_DIR}" ]] || LOCK_DIR="/tmp"
+LOCK_FILE="${LOCK_DIR}/x-ui-clean-ops.lock"
+exec 9>"${LOCK_FILE}"
+if ! flock -n 9; then
+    _fail "ERROR: Another 3X-UI install/update/backup/rollback operation is already running (lock: ${LOCK_FILE})."
 fi
 
 # ------------------------------------------------------------------------------

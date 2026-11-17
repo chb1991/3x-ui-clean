@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# 3X-UI Clean — Full Consistent Backup Script (SQLite WAL-Safe + Binaries + Unit)
+# 3X-UI Clean — Full Consistent Backup Script (Mutex-Locked & WAL-Verified)
 # Repository: https://github.com/chb1991/3x-ui-clean
 # License: GPL-3.0
 # ==============================================================================
 set -euo pipefail
 
-# Load custom paths if configured in /etc/default/x-ui
 if [[ -f /etc/default/x-ui ]]; then
     # shellcheck disable=SC1091
     source /etc/default/x-ui
@@ -22,6 +21,7 @@ stop_service=0
 restart_after=0
 tag="manual"
 quiet=0
+no_lock=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -40,6 +40,10 @@ while [[ $# -gt 0 ]]; do
         --keep)
             keep_count="${2:-10}"
             shift 2
+            ;;
+        --no-lock)
+            no_lock=1
+            shift
             ;;
         --quiet|-q)
             quiet=1
@@ -80,6 +84,20 @@ if [[ "${EUID}" -ne 0 ]]; then
     exit 1
 fi
 
+# ------------------------------------------------------------------------------
+# Process Mutex Lock (prevents concurrent backup/update/rollback races)
+# ------------------------------------------------------------------------------
+if [[ "${no_lock}" -eq 0 ]]; then
+    LOCK_DIR="/run/lock"
+    [[ -d "${LOCK_DIR}" ]] || LOCK_DIR="/tmp"
+    LOCK_FILE="${LOCK_DIR}/x-ui-clean-ops.lock"
+    exec 9>"${LOCK_FILE}"
+    if ! flock -n 9; then
+        log_err "Another 3X-UI operation (install/update/backup/rollback) is currently running (lock: ${LOCK_FILE})."
+        exit 1
+    fi
+fi
+
 if [[ ! -d "${xui_db_folder}" && ! -d "${xui_folder}" ]]; then
     log_err "Neither ${xui_db_folder} nor ${xui_folder} exists; nothing to back up."
     exit 1
@@ -88,10 +106,40 @@ fi
 mkdir -p "${backup_root}"
 chmod 700 "${backup_root}"
 
+_is_xui_running() {
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet x-ui 2>/dev/null; then
+        return 0
+    fi
+    if pgrep -f "${xui_folder}/x-ui" >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+_stop_xui_and_verify() {
+    log_info "Stopping x-ui service and verifying process termination..."
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl stop x-ui 2>/dev/null || true
+    elif command -v rc-service >/dev/null 2>&1; then
+        rc-service x-ui stop 2>/dev/null || true
+    fi
+
+    local i
+    for i in {1..15}; do
+        if ! _is_xui_running; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    log_err "Failed to stop x-ui service after 15 seconds; process is still active. Refusing to take an inconsistent backup."
+    return 1
+}
+
 # Detect current panel version and settings before stopping
 cur_ver="unknown"
 if [[ -x "${xui_folder}/x-ui" ]]; then
-    cur_ver="$("${xui_folder}/x-ui" -v 2>/dev/null | head -n1 | tr -d '[:space:]' || echo 'unknown')"
+    cur_ver="$("${xui_folder}/x-ui" -v 2>/dev/null | head -n1 | tr -d '[:space:]' || true)"
     [[ -n "${cur_ver}" ]] || cur_ver="unknown"
 fi
 
@@ -104,15 +152,11 @@ if [[ -x "${xui_folder}/x-ui" ]]; then
 fi
 
 was_active=0
-if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet x-ui 2>/dev/null; then
+if _is_xui_running; then
     was_active=1
 fi
 
-if [[ "${stop_service}" -eq 1 && "${was_active}" -eq 1 ]]; then
-    log_info "Stopping x-ui service to flush SQLite WAL state..."
-    systemctl stop x-ui 2>/dev/null || rc-service x-ui stop 2>/dev/null || true
-fi
-
+service_stopped_by_us=0
 ts="$(date +%Y%m%d-%H%M%S)"
 safe_tag="$(echo "${tag}" | tr -cd 'A-Za-z0-9._-')"
 safe_ver="$(echo "${cur_ver}" | tr -cd 'A-Za-z0-9._-')"
@@ -121,8 +165,10 @@ archive_path="${backup_root}/${archive_name}"
 stage_dir="$(mktemp -d "${backup_root}/.stage-${ts}-XXXXXX")"
 
 cleanup_stage() {
+    set +e
     rm -rf "${stage_dir}"
-    if [[ "${stop_service}" -eq 1 && "${restart_after}" -eq 1 && "${was_active}" -eq 1 ]]; then
+    if [[ "${service_stopped_by_us}" -eq 1 && "${restart_after}" -eq 1 && "${was_active}" -eq 1 ]]; then
+        log_info "Restarting x-ui service after backup..."
         systemctl start x-ui 2>/dev/null || rc-service x-ui start 2>/dev/null || true
     fi
 }
@@ -131,25 +177,10 @@ trap cleanup_stage EXIT
 log_info "Staging consistent snapshot in ${stage_dir}..."
 mkdir -p "${stage_dir}/db" "${stage_dir}/main" "${stage_dir}/system"
 
-# 1. Back up database folder (/etc/x-ui)
-if [[ -d "${xui_db_folder}" ]]; then
-    cp -a "${xui_db_folder}/." "${stage_dir}/db/"
-    # If service is still running (live backup) and sqlite3 CLI is present, also create an online atomic .backup copy
-    if [[ "${stop_service}" -eq 0 && -f "${xui_db_folder}/x-ui.db" ]] && command -v sqlite3 >/dev/null 2>&1; then
-        log_info "Running sqlite3 online backup API for live WAL consistency..."
-        if sqlite3 "${xui_db_folder}/x-ui.db" ".backup '${stage_dir}/db/x-ui.db.atomic'" 2>/dev/null; then
-            mv -f "${stage_dir}/db/x-ui.db.atomic" "${stage_dir}/db/x-ui.db"
-            rm -f "${stage_dir}/db/x-ui.db-wal" "${stage_dir}/db/x-ui.db-shm"
-        fi
-    fi
-fi
-
-# 2. Back up main folder (/usr/local/x-ui)
+# 1. Stage application binaries & service units first (static while running)
 if [[ -d "${xui_folder}" ]]; then
     cp -a "${xui_folder}/." "${stage_dir}/main/"
 fi
-
-# 3. Back up CLI wrapper, env file, and service units
 if [[ -f /usr/bin/x-ui ]]; then
     cp -a /usr/bin/x-ui "${stage_dir}/system/x-ui-bin"
 fi
@@ -164,10 +195,72 @@ if [[ -d "${xui_service}/x-ui.service.d" ]]; then
     cp -a "${xui_service}/x-ui.service.d/." "${stage_dir}/system/x-ui.service.d/"
 fi
 if [[ -f /etc/init.d/x-ui ]]; then
-    cp -a /etc/init.d/x-ui "${stage_dir}/system/x-ui.initd"
+    cp -a "${stage_dir}/system/x-ui.initd" /etc/init.d/x-ui 2>/dev/null || cp -a /etc/init.d/x-ui "${stage_dir}/system/x-ui.initd"
 fi
 
-# 4. Write metadata manifest
+# 2. Back up database folder (/etc/x-ui) with strict WAL consistency
+if [[ -d "${xui_db_folder}" ]]; then
+    # Copy non-SQLite config files in /etc/x-ui (e.g. node_token_key.json)
+    for item in "${xui_db_folder}"/*; do
+        [[ -e "${item}" ]] || continue
+        base_item="$(basename "${item}")"
+        case "${base_item}" in
+            x-ui.db|x-ui.db-wal|x-ui.db-shm|update-status.json*)
+                continue
+                ;;
+            *)
+                cp -a "${item}" "${stage_dir}/db/"
+                ;;
+        esac
+    done
+
+    if [[ -f "${xui_db_folder}/x-ui.db" ]]; then
+        online_backup_ok=0
+        if [[ "${stop_service}" -eq 0 && "${was_active}" -eq 1 ]]; then
+            if command -v sqlite3 >/dev/null 2>&1; then
+                log_info "Running SQLite online backup API (.backup) with integrity verification..."
+                if sqlite3 -cmd ".timeout 10000" "${xui_db_folder}/x-ui.db" ".backup '${stage_dir}/db/x-ui.db'" 2>/dev/null; then
+                    integrity="$(sqlite3 "${stage_dir}/db/x-ui.db" "PRAGMA integrity_check;" 2>/dev/null | head -n1 || true)"
+                    if [[ "${integrity}" == "ok" && -s "${stage_dir}/db/x-ui.db" ]]; then
+                        online_backup_ok=1
+                    else
+                        log_warn "SQLite online backup integrity check returned '${integrity}'; falling back to brief service stop."
+                        rm -f "${stage_dir}/db/x-ui.db"
+                    fi
+                else
+                    log_warn "sqlite3 .backup command failed; falling back to brief service stop."
+                    rm -f "${stage_dir}/db/x-ui.db"
+                fi
+            else
+                log_warn "sqlite3 CLI not installed; falling back to brief service stop for WAL-safe cold backup."
+            fi
+
+            if [[ "${online_backup_ok}" -eq 0 ]]; then
+                stop_service=1
+                restart_after=1
+            fi
+        fi
+
+        if [[ "${online_backup_ok}" -eq 0 ]]; then
+            if _is_xui_running; then
+                _stop_xui_and_verify
+                service_stopped_by_us=1
+            fi
+            cp -a "${xui_db_folder}/x-ui.db" "${stage_dir}/db/x-ui.db"
+            [[ -f "${xui_db_folder}/x-ui.db-wal" ]] && cp -a "${xui_db_folder}/x-ui.db-wal" "${stage_dir}/db/x-ui.db-wal"
+            [[ -f "${xui_db_folder}/x-ui.db-shm" ]] && cp -a "${xui_db_folder}/x-ui.db-shm" "${stage_dir}/db/x-ui.db-shm"
+
+            src_sha="$(sha256sum "${xui_db_folder}/x-ui.db" | awk '{print $1}')"
+            dst_sha="$(sha256sum "${stage_dir}/db/x-ui.db" | awk '{print $1}')"
+            if [[ -z "${src_sha}" || "${src_sha}" != "${dst_sha}" ]]; then
+                log_err "Database copy SHA256 mismatch (${src_sha} != ${dst_sha})!"
+                exit 1
+            fi
+        fi
+    fi
+fi
+
+# 3. Write metadata manifest
 db_sha256=""
 [[ -f "${stage_dir}/db/x-ui.db" ]] && db_sha256="$(sha256sum "${stage_dir}/db/x-ui.db" | awk '{print $1}')"
 bin_sha256=""
@@ -188,15 +281,46 @@ DB_SHA256="${db_sha256}"
 BIN_SHA256="${bin_sha256}"
 EOF
 
-# 5. Create compressed archive and SHA256 checksum
-tar -C "${stage_dir}" -czf "${archive_path}" .
+# 4. Create compressed archive and strictly verify archive integrity
+log_info "Creating and verifying backup archive ${archive_path}..."
+if ! tar -C "${stage_dir}" -czf "${archive_path}" .; then
+    rm -f "${archive_path}"
+    log_err "tar failed to create backup archive ${archive_path}!"
+    exit 1
+fi
+
+if [[ ! -s "${archive_path}" ]]; then
+    rm -f "${archive_path}"
+    log_err "Backup archive ${archive_path} is empty!"
+    exit 1
+fi
+
+tar_listing="$(tar -tzf "${archive_path}" 2>/dev/null || true)"
+if [[ -z "${tar_listing}" ]]; then
+    rm -f "${archive_path}"
+    log_err "Backup archive ${archive_path} failed tar -tzf integrity check!"
+    exit 1
+fi
+
+if [[ -f "${xui_db_folder}/x-ui.db" ]] && ! echo "${tar_listing}" | grep -qE '^\./db/x-ui\.db$'; then
+    rm -f "${archive_path}"
+    log_err "Backup archive is missing ./db/x-ui.db!"
+    exit 1
+fi
+
+if ! echo "${tar_listing}" | grep -qE '^\./backup-meta\.env$'; then
+    rm -f "${archive_path}"
+    log_err "Backup archive is missing ./backup-meta.env!"
+    exit 1
+fi
+
 chmod 600 "${archive_path}"
 (cd "${backup_root}" && sha256sum "${archive_name}" > "${archive_name}.sha256")
 chmod 600 "${archive_path}.sha256"
 ln -sfn "${archive_path}" "${backup_root}/latest.tar.gz"
 ln -sfn "${archive_path}.sha256" "${backup_root}/latest.tar.gz.sha256"
 
-# 6. Prune old backups if keep_count > 0
+# 5. Prune old backups if keep_count > 0
 if [[ "${keep_count}" =~ ^[0-9]+$ && "${keep_count}" -gt 0 ]]; then
     mapfile -t archives < <(find "${backup_root}" -maxdepth 1 -type f -name 'x-ui-backup-*.tar.gz' | sort -r)
     if [[ "${#archives[@]}" -gt "${keep_count}" ]]; then
@@ -207,5 +331,5 @@ if [[ "${keep_count}" =~ ^[0-9]+$ && "${keep_count}" -gt 0 ]]; then
     fi
 fi
 
-log_info "Backup completed successfully: ${archive_path}"
+log_info "Backup completed and verified: ${archive_path}"
 printf '%s\n' "${archive_path}"
