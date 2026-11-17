@@ -100,10 +100,10 @@ _report_update_exit() {
     if (( code != 0 )); then
         if (( rollback_needed == 1 )); then
             if _trigger_auto_rollback; then
-                _write_update_status "failed_rolled_back" "${code}"
+                _write_update_status "failed" "${code}"
             else
                 echo "[CRITICAL] Automatic rollback failed; use the independently verified manual backup" >&2
-                _write_update_status "rollback_failed" "${code}"
+                _write_update_status "failed" "${code}"
             fi
         else
             if (( service_stopped_by_us == 1 )); then
