@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # 3X-UI Clean — Unified Online & Offline Installer (Existing-DB Safe)
+# CLEAN_SCRIPT_PROTOCOL=2
 # Repository: https://github.com/chb1991/3x-ui-clean
 # License: GPL-3.0
 # ==============================================================================
@@ -24,6 +25,7 @@ xui_db_folder="${XUI_DB_FOLDER:-/etc/x-ui}"
 xui_service="${XUI_SERVICE:-/etc/systemd/system}"
 xui_log_folder="${XUI_LOG_FOLDER:-/var/log/x-ui}"
 backup_root="${XUI_BACKUP_DIR:-/var/backups/x-ui}"
+staging_root="${XUI_STAGING_DIR:-/var/tmp}"
 
 offline_archive=""
 target_tag=""
@@ -89,24 +91,30 @@ if [[ -f "${xui_db_folder}/x-ui.db" && -f "${xui_folder}/x-ui" && "${force_fresh
     echo -e "${yellow}  nodes, VLESS/REALITY keys, port, listenIP, and webBasePath!  ${plain}"
     echo -e "${yellow}═══════════════════════════════════════════════════════════════${plain}"
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
-    if [[ -n "${script_dir}" && -f "${script_dir}/update.sh" ]]; then
+    if [[ -f "${script_dir}/update.sh" ]]; then
         exec bash "${script_dir}/update.sh" "${orig_args[@]}"
-    elif [[ -f "./scripts/update.sh" ]]; then
-        exec bash "./scripts/update.sh" "${orig_args[@]}"
-    elif [[ -f "./update.sh" ]]; then
-        exec bash "./update.sh" "${orig_args[@]}"
-    else
-        tmp_up="$(mktemp "/tmp/x-ui-clean-update-XXXXXX.sh")"
-        if ! curl -fsSL --retry 3 --connect-timeout 15 "https://raw.githubusercontent.com/${CLEAN_REPO}/main/scripts/update.sh" -o "${tmp_up}" || [[ ! -s "${tmp_up}" ]]; then
-            rm -f "${tmp_up}"
-            _fail "ERROR: Failed to download update.sh from ${CLEAN_REPO}."
-        fi
-        chmod +x "${tmp_up}"
-        bash "${tmp_up}" "${orig_args[@]}"
-        rc=$?
-        rm -f "${tmp_up}"
-        exit "${rc}"
     fi
+    if [[ -z "${target_tag}" ]]; then
+        target_tag="$(curl -fsSL --retry 3 "https://api.github.com/repos/${CLEAN_REPO}/releases/latest" | grep '"tag_name":' | sed -E 's/.*"tag_name": "([^"]+)".*/\1/' | head -1)"
+    fi
+    [[ "${target_tag}" =~ ^v[0-9]+[.][0-9]+[.][0-9]+$ ]] || _fail "ERROR: Could not resolve a stable Release tag"
+    tmp_up="$(mktemp "${staging_root}/x-ui-clean-update-XXXXXXXX.sh")"
+    if ! curl -fsSL --retry 3 "https://raw.githubusercontent.com/${CLEAN_REPO}/${target_tag}/scripts/update.sh" -o "${tmp_up}" || [[ ! -s "${tmp_up}" ]]; then
+        rm -f "${tmp_up}"
+        _fail "ERROR: Unable to download release-pinned update.sh"
+    fi
+    if bash "${tmp_up}" "${orig_args[@]}"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    rm -f "${tmp_up}"
+    exit "${rc}"
+fi
+
+# If either half of an old installation remains, refuse to create fresh credentials.
+if [[ -f "${xui_db_folder}/x-ui.db" || -f "${xui_folder}/x-ui" ]] && [[ "${force_fresh}" -eq 0 ]]; then
+    _fail "ERROR: Partial existing installation detected; manual diagnosis required. Fresh installation would risk resetting credentials."
 fi
 
 # ------------------------------------------------------------------------------
@@ -171,7 +179,10 @@ if [[ -z "${offline_archive}" ]]; then
     esac
 fi
 
-stage_dir="$(mktemp -d "/tmp/x-ui-install-stage-XXXXXX")"
+install -d -m 700 "${staging_root}"
+free_kib="$(df -Pk "${staging_root}" | awk 'NR==2 {print $4}')"
+[[ "${free_kib}" =~ ^[0-9]+$ && "${free_kib}" -ge 786432 ]] || _fail "ERROR: Need 768 MiB free space on disk-backed staging"
+stage_dir="$(mktemp -d "${staging_root}/x-ui-install-stage-XXXXXXXX")"
 trap 'rm -rf "${stage_dir}"' EXIT
 archive_file="${stage_dir}/x-ui-linux-${TARGET_ARCH}.tar.gz"
 bundled_scripts_dir=""
@@ -180,16 +191,14 @@ if [[ -n "${offline_archive}" ]]; then
     [[ ! -f "${offline_archive}" ]] && _fail "ERROR: Offline archive not found: ${offline_archive}"
     offline_abs="$(readlink -f "${offline_archive}")"
     echo -e "${green}[2/5] Validating offline archive: ${offline_abs}${plain}"
-    if [[ -f "${offline_abs}.sha256" ]]; then
-        (cd "$(dirname "${offline_abs}")" && sha256sum -c "$(basename "${offline_abs}.sha256")") || _fail "ERROR: Offline archive SHA256 mismatch!"
-    fi
+    [[ -f "${offline_abs}.sha256" ]] || _fail "ERROR: Missing offline .sha256 sidecar"
+    (cd "$(dirname "${offline_abs}")" && sha256sum -c "$(basename "${offline_abs}.sha256")") || _fail "ERROR: Offline archive SHA256 mismatch!"
     tar -C "${stage_dir}" -xzf "${offline_abs}" || _fail "ERROR: Failed to extract offline archive."
     if [[ ! -f "${stage_dir}/x-ui/x-ui" ]]; then
         inner_tar="$(find "${stage_dir}" -type f -name "x-ui-linux-${TARGET_ARCH}.tar.gz" | head -n1 || true)"
         [[ -z "${inner_tar}" ]] && _fail "ERROR: Offline archive does not contain x-ui-linux-${TARGET_ARCH}.tar.gz"
-        if [[ -f "${inner_tar}.sha256" ]]; then
-            (cd "$(dirname "${inner_tar}")" && sha256sum -c "$(basename "${inner_tar}.sha256")") || _fail "ERROR: Inner archive SHA256 mismatch!"
-        fi
+        [[ -f "${inner_tar}.sha256" ]] || _fail "ERROR: Missing inner archive checksum"
+        (cd "$(dirname "${inner_tar}")" && sha256sum -c "$(basename "${inner_tar}.sha256")") || _fail "ERROR: Inner archive SHA256 mismatch!"
         tar -C "${stage_dir}" -xzf "${inner_tar}" || _fail "ERROR: Failed to extract inner x-ui archive."
     fi
     bundled_scripts_dir="$(find "${stage_dir}" -maxdepth 2 -type d -name "scripts" | head -n1 || true)"
@@ -209,10 +218,12 @@ else
     echo -e "${green}[2/5] Downloading 3X-UI Clean ${target_tag} (${TARGET_ARCH})...${plain}"
     curl -fL --retry 5 --retry-delay 3 --connect-timeout 15 -o "${archive_file}" "${download_url}" || _fail "ERROR: Failed to download ${download_url}"
 
-    if curl -fsSL --retry 3 --connect-timeout 15 -o "${archive_file}.sha256" "${sha_url}" 2>/dev/null; then
+    if curl -fsSL --retry 3 --connect-timeout 15 -o "${archive_file}.sha256" "${sha_url}"; then
         expected_sha="$(awk '{print $1}' "${archive_file}.sha256" | tr 'A-F' 'a-f')"
         actual_sha="$(sha256sum "${archive_file}" | awk '{print $1}' | tr 'A-F' 'a-f')"
         [[ "${expected_sha}" != "${actual_sha}" ]] && _fail "ERROR: SHA256 mismatch!"
+    else
+        _fail "ERROR: Missing checksum for online install archive"
     fi
     tar -C "${stage_dir}" -xzf "${archive_file}" || _fail "ERROR: Failed to extract downloaded archive."
 fi
@@ -227,7 +238,9 @@ if [[ "${TARGET_ARCH}" == "armv5" || "${TARGET_ARCH}" == "armv6" || "${TARGET_AR
 fi
 
 echo -e "${green}[3/5] Installing files to ${xui_folder}...${plain}"
-systemctl stop x-ui >/dev/null 2>&1 || true
+if systemctl is-active --quiet x-ui; then
+    _fail "ERROR: x-ui service is already active; refusing fresh installation over a running service"
+fi
 mkdir -p "${xui_folder}/bin" "${xui_folder}/scripts" "${xui_db_folder}" "${xui_log_folder}" "${backup_root}"
 chmod 700 "${backup_root}"
 
