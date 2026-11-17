@@ -100,6 +100,18 @@ _is_xui_running() {
     return 1
 }
 
+_panel_xray_alive() {
+    local entry exe
+    for entry in /proc/[0-9]*/exe; do
+        [[ -e "${entry}" ]] || continue
+        exe="$(readlink -f "${entry}" 2>/dev/null || true)"
+        case "${exe}" in
+            "${xui_folder}/bin/xray-linux-"*|"${xui_folder}/bin/xray") return 0 ;;
+        esac
+    done
+    return 1
+}
+
 _stop_xui_and_verify() {
     log_info "Stopping x-ui and verifying process termination..."
     systemctl stop x-ui || { log_err "systemctl stop x-ui failed; refusing to restore live database"; return 1; }
@@ -193,6 +205,7 @@ read_meta() {
 }
 PANEL_VERSION="$(read_meta PANEL_VERSION)"
 PANEL_PORT="$(read_meta PANEL_PORT)"
+PANEL_XRAY_RUNNING="$(read_meta PANEL_XRAY_RUNNING)"
 BACKUP_CREATED_UTC="$(read_meta BACKUP_CREATED_UTC)"
 DB_SHA256="$(read_meta DB_SHA256)"
 BIN_SHA256="$(read_meta BIN_SHA256)"
@@ -352,4 +365,8 @@ if [[ "${healthy}" -ne 1 ]]; then
     exit 1
 fi
 
+if [[ "${PANEL_XRAY_RUNNING:-0}" == "1" ]] && ! _panel_xray_alive; then
+    log_err "Rollback restored the panel, but the managed Xray process did not restart!"
+    exit 1
+fi
 log_info "Rollback succeeded! Database, binaries, and panel service (port ${check_port:-ok}) are fully verified."
