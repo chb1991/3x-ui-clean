@@ -155,4 +155,6 @@ assert db.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
 assert db.execute('SELECT v FROM secrets WHERE k=?',('REALITY',)).fetchone()[0] == 'keep-this-key'
 db.close()
 PY
+[[ "$(cat /etc/systemd/system/x-ui.service)" == 'OLD-SYSTEMD-UNIT' ]] || { echo 'Unit was overwritten during ad-only upgrade'; exit 1; }
+[[ "$(cat /etc/systemd/system/x-ui.service.d/10-xui-sandbox.conf)" == 'OLD-DROPIN' ]] || { echo 'Production sandbox drop-in changed unexpectedly'; exit 1; }
 echo 'PASS: Debian 13 successful clean upgrade preserves REALITY, Xray config, Xray binary and panel settings'
