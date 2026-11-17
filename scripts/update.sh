@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # 3X-UI Clean — Transactional Safe Upgrade Script (Mutex-Locked & Backup-Verified)
+# CLEAN_SCRIPT_PROTOCOL=2
 # Repository: https://github.com/chb1991/3x-ui-clean
 # License: GPL-3.0
 # ==============================================================================
-set -euo pipefail
+set -Eeuo pipefail
 
 red='\033[0;31m'
 green='\033[0;32m'
@@ -24,6 +25,7 @@ xui_db_folder="${XUI_DB_FOLDER:-/etc/x-ui}"
 xui_service="${XUI_SERVICE:-/etc/systemd/system}"
 xui_log_folder="${XUI_LOG_FOLDER:-/var/log/x-ui}"
 backup_root="${XUI_BACKUP_DIR:-/var/backups/x-ui}"
+staging_root="${XUI_STAGING_DIR:-/var/tmp}"
 
 # ------------------------------------------------------------------------------
 # Web Panel Updater Status Contract (compatible with internal/web/service/panel/panel.go)
@@ -48,115 +50,75 @@ stage_dir=""
 bkp_stage=""
 pre_upgrade_backup=""
 rollback_needed=0
+service_stopped_by_us=0
 existing_port=""
 
 _is_xui_running() {
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet x-ui 2>/dev/null; then
         return 0
     fi
-    if pgrep -f "${xui_folder}/x-ui" >/dev/null 2>&1; then
+    if pgrep -x x-ui >/dev/null 2>&1; then
         return 0
     fi
     return 1
 }
 
 _stop_xui_and_verify() {
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl stop x-ui >/dev/null 2>&1 || true
-    elif command -v rc-service >/dev/null 2>&1; then
-        rc-service x-ui stop >/dev/null 2>&1 || true
-    fi
-    pkill -f 'mtg-linux-[^ ]* run ' >/dev/null 2>&1 || true
-
+    # Never copy or replace a live SQLite database if stopping systemd failed.
+    systemctl stop x-ui >/dev/null 2>&1 || {
+        echo "[ERROR] Failed to stop x-ui.service" >&2
+        return 1
+    }
     local i
-    for i in {1..15}; do
-        if ! _is_xui_running; then
-            return 0
-        fi
+    for i in {1..20}; do
+        if ! _is_xui_running; then return 0; fi
         sleep 1
     done
+    echo "[ERROR] x-ui process remains alive after systemctl stop" >&2
     return 1
 }
 
 _trigger_auto_rollback() {
-    set +e
-    if [[ -z "${pre_upgrade_backup}" || ! -f "${pre_upgrade_backup}" ]]; then
-        echo -e "${red}[AUTO-ROLLBACK] No verified pre-upgrade backup archive available to restore.${plain}" >&2
+    local helper="${stage_dir}/helper-scripts/rollback.sh"
+    [[ -n "${pre_upgrade_backup}" && -s "${pre_upgrade_backup}" &&
+       -f "${pre_upgrade_backup}.sha256" && -f "${helper}" ]] || {
+        echo "[CRITICAL] Rollback preconditions failed: missing archive, checksum or pinned script" >&2
         return 1
-    fi
-    echo -e "${yellow}[AUTO-ROLLBACK] Upgrade failed! Restoring verified pre-upgrade snapshot: ${pre_upgrade_backup}${plain}" >&2
-    _stop_xui_and_verify || true
-
-    local rb_stage
-    rb_stage="$(mktemp -d "/tmp/x-ui-autorollback-XXXXXX")"
-    if tar -C "${rb_stage}" -xzf "${pre_upgrade_backup}" 2>/dev/null; then
-        local DB_SHA256="" BIN_SHA256=""
-        if [[ -f "${rb_stage}/backup-meta.env" ]]; then
-            # shellcheck disable=SC1090
-            source "${rb_stage}/backup-meta.env"
-        fi
-        if [[ -d "${rb_stage}/db" ]]; then
-            rm -f "${xui_db_folder}/x-ui.db-wal" "${xui_db_folder}/x-ui.db-shm"
-            cp -a "${rb_stage}/db/." "${xui_db_folder}/"
-            chmod 600 "${xui_db_folder}/x-ui.db" 2>/dev/null || true
-            if [[ -n "${DB_SHA256}" && -f "${xui_db_folder}/x-ui.db" ]]; then
-                local cur_db_sha
-                cur_db_sha="$(sha256sum "${xui_db_folder}/x-ui.db" | awk '{print $1}')"
-                if [[ "${cur_db_sha}" == "${DB_SHA256}" ]]; then
-                    echo -e "${green}[AUTO-ROLLBACK] Restored database SHA256 verified.${plain}" >&2
-                else
-                    echo -e "${red}[AUTO-ROLLBACK] WARNING: Restored database SHA256 mismatch!${plain}" >&2
-                fi
-            fi
-        fi
-        if [[ -d "${rb_stage}/main" ]]; then
-            rm -rf "${xui_folder:?}/"*
-            cp -a "${rb_stage}/main/." "${xui_folder}/"
-            chmod +x "${xui_folder}/x-ui" "${xui_folder}/x-ui.sh" 2>/dev/null || true
-            chmod +x "${xui_folder}"/bin/xray-linux-* "${xui_folder}"/bin/mtg-linux-* 2>/dev/null || true
-            if [[ -n "${BIN_SHA256}" && -f "${xui_folder}/x-ui" ]]; then
-                local cur_bin_sha
-                cur_bin_sha="$(sha256sum "${xui_folder}/x-ui" | awk '{print $1}')"
-                [[ "${cur_bin_sha}" == "${BIN_SHA256}" ]] && echo -e "${green}[AUTO-ROLLBACK] Restored binary SHA256 verified.${plain}" >&2
-            fi
-        fi
-        if [[ -f "${rb_stage}/system/x-ui-bin" ]]; then
-            cp -a "${rb_stage}/system/x-ui-bin" /usr/bin/x-ui
-            chmod +x /usr/bin/x-ui
-        fi
-        if [[ -f "${rb_stage}/system/x-ui.service" ]]; then
-            cp -a "${rb_stage}/system/x-ui.service" "${xui_service}/x-ui.service"
-        fi
-        if [[ -d "${rb_stage}/system/x-ui.service.d" ]]; then
-            mkdir -p "${xui_service}/x-ui.service.d"
-            cp -a "${rb_stage}/system/x-ui.service.d/." "${xui_service}/x-ui.service.d/"
-        fi
-        systemctl daemon-reload >/dev/null 2>&1 || true
-        systemctl start x-ui >/dev/null 2>&1 || rc-service x-ui start >/dev/null 2>&1 || true
-        sleep 2
-        if _is_xui_running; then
-            echo -e "${green}[AUTO-ROLLBACK] Previous version and database restored and running.${plain}" >&2
-        else
-            echo -e "${red}[AUTO-ROLLBACK] Service failed to start after rollback! Check: journalctl -u x-ui -n 50${plain}" >&2
-        fi
-    fi
-    rm -rf "${rb_stage}"
+    }
+    grep -q '^# CLEAN_SCRIPT_PROTOCOL=2$' "${helper}" || {
+        echo "[CRITICAL] Refusing obsolete rollback helper" >&2
+        return 1
+    }
+    echo "[AUTO-ROLLBACK] Running verified tagged rollback helper" >&2
+    bash "${helper}" --auto "${pre_upgrade_backup}" --no-lock
 }
 
 _report_update_exit() {
     local code=$?
+    trap - EXIT
     set +e
-    [[ -n "${stage_dir}" && -d "${stage_dir}" ]] && rm -rf "${stage_dir}"
-    [[ -n "${bkp_stage}" && -d "${bkp_stage}" ]] && rm -rf "${bkp_stage}"
-    if [[ "${code}" -eq 0 ]]; then
-        _write_update_status "success" "0"
-    else
-        if [[ "${rollback_needed}" -eq 1 ]]; then
-            _trigger_auto_rollback
+    if (( code != 0 )); then
+        if (( rollback_needed == 1 )); then
+            if _trigger_auto_rollback; then
+                _write_update_status "failed" "${code}"
+            else
+                echo "[CRITICAL] Automatic rollback failed; use the independently verified manual backup" >&2
+                _write_update_status "failed" "${code}"
+            fi
+        else
+            if (( service_stopped_by_us == 1 )); then
+                systemctl start x-ui || echo "[CRITICAL] Could not restart original service after aborted backup" >&2
+            fi
+            _write_update_status "failed" "${code}"
         fi
-        _write_update_status "failed" "${code}"
+    else
+        _write_update_status "success" 0
     fi
+    [[ -n "${stage_dir}" && -d "${stage_dir}" ]] && rm -rf -- "${stage_dir}"
+    [[ -n "${bkp_stage}" && -d "${bkp_stage}" ]] && rm -rf -- "${bkp_stage}"
+    return 0
 }
+
 trap _report_update_exit EXIT
 trap 'exit 143' TERM
 trap 'exit 130' INT
@@ -275,7 +237,10 @@ fi
 # ------------------------------------------------------------------------------
 # Step 1: Pre-Stage & Validate New Release Archive (Before Stopping Service!)
 # ------------------------------------------------------------------------------
-stage_dir="$(mktemp -d "/tmp/x-ui-update-stage-XXXXXX")"
+install -d -m 700 "${staging_root}"
+free_kib="$(df -Pk "${staging_root}" | awk 'NR == 2 {print $4}')"
+[[ "${free_kib}" =~ ^[0-9]+$ && "${free_kib}" -ge 786432 ]] || _fail "ERROR: Need at least 768 MiB free space under ${staging_root}; /tmp is tmpfs on small VPS."
+stage_dir="$(mktemp -d "${staging_root}/x-ui-update-stage-XXXXXX")"
 archive_file="${stage_dir}/x-ui-linux-${TARGET_ARCH}.tar.gz"
 bundled_scripts_dir=""
 
@@ -283,16 +248,14 @@ if [[ -n "${offline_archive}" ]]; then
     [[ ! -f "${offline_archive}" ]] && _fail "ERROR: Offline archive not found: ${offline_archive}"
     offline_abs="$(readlink -f "${offline_archive}")"
     echo -e "${green}[1/6] Validating offline archive: ${offline_abs}${plain}"
-    if [[ -f "${offline_abs}.sha256" ]]; then
-        (cd "$(dirname "${offline_abs}")" && sha256sum -c "$(basename "${offline_abs}.sha256")") || _fail "ERROR: Offline archive SHA256 mismatch!"
-    fi
+    [[ -f "${offline_abs}.sha256" ]] || _fail "ERROR: Missing offline .sha256 sidecar; verify the Release checksum before upgrading."
+    (cd "$(dirname "${offline_abs}")" && sha256sum -c "$(basename "${offline_abs}.sha256")") || _fail "ERROR: Offline archive SHA256 mismatch!"
     tar -C "${stage_dir}" -xzf "${offline_abs}" || _fail "ERROR: Failed to extract offline archive."
     if [[ ! -f "${stage_dir}/x-ui/x-ui" ]]; then
         inner_tar="$(find "${stage_dir}" -type f -name "x-ui-linux-${TARGET_ARCH}.tar.gz" | head -n1 || true)"
         [[ -z "${inner_tar}" ]] && _fail "ERROR: Offline archive does not contain x-ui/ or x-ui-linux-${TARGET_ARCH}.tar.gz"
-        if [[ -f "${inner_tar}.sha256" ]]; then
-            (cd "$(dirname "${inner_tar}")" && sha256sum -c "$(basename "${inner_tar}.sha256")") || _fail "ERROR: Inner archive SHA256 mismatch!"
-        fi
+        [[ -f "${inner_tar}.sha256" ]] || _fail "ERROR: Missing inner archive .sha256"
+        (cd "$(dirname "${inner_tar}")" && sha256sum -c "$(basename "${inner_tar}.sha256")") || _fail "ERROR: Inner archive SHA256 mismatch!"
         tar -C "${stage_dir}" -xzf "${inner_tar}" || _fail "ERROR: Failed to extract inner x-ui archive."
     fi
     bundled_scripts_dir="$(find "${stage_dir}" -maxdepth 2 -type d -name "scripts" | head -n1 || true)"
@@ -308,7 +271,11 @@ else
         [[ -z "${target_tag}" ]] && _fail "ERROR: Could not resolve latest release tag from ${CLEAN_REPO}."
     fi
 
-    download_url="https://github.com/${CLEAN_REPO}/releases/download/${target_tag}/x-ui-linux-${TARGET_ARCH}.tar.gz"
+    # Download the fully versioned bundle containing the exact matching helper
+    # scripts. The upstream numeric Git tag may refer to an older commit; do not
+    # fetch rollback logic from the tag's raw source tree.
+    archive_file="${stage_dir}/3x-ui-clean-${target_tag}-linux-${TARGET_ARCH}-offline.tar.gz"
+    download_url="https://github.com/${CLEAN_REPO}/releases/download/${target_tag}/$(basename "${archive_file}")"
     sha_url="${download_url}.sha256"
     echo -e "${green}[1/6] Downloading 3X-UI Clean ${target_tag} (${TARGET_ARCH})...${plain}"
     curl -fL --retry 5 --retry-delay 3 --connect-timeout 15 -o "${archive_file}" "${download_url}" || _fail "ERROR: Failed to download ${download_url}"
@@ -324,7 +291,14 @@ else
         _fail "ERROR: SHA256 mismatch! Expected ${expected_sha}, got ${actual_sha}"
     fi
 
-    tar -C "${stage_dir}" -xzf "${archive_file}" || _fail "ERROR: Failed to extract downloaded archive."
+    tar -C "${stage_dir}" -xzf "${archive_file}" || _fail "ERROR: Failed to extract downloaded offline bundle."
+    inner_tar="$(find "${stage_dir}" -maxdepth 3 -type f -name "x-ui-linux-${TARGET_ARCH}.tar.gz" | head -n1 || true)"
+    [[ -n "${inner_tar}" && -f "${inner_tar}.sha256" ]] ||
+        _fail "ERROR: Downloaded bundle missing inner application archive and matching checksum"
+    (cd "$(dirname "${inner_tar}")" && sha256sum -c "$(basename "${inner_tar}.sha256")") ||
+        _fail "ERROR: Inner application checksum failed"
+    tar -C "${stage_dir}" -xzf "${inner_tar}" || _fail "ERROR: Failed to extract application archive"
+    bundled_scripts_dir="$(find "${stage_dir}" -maxdepth 2 -type d -name scripts | head -n1 || true)"
 fi
 
 [[ ! -s "${stage_dir}/x-ui/x-ui" ]] && _fail "ERROR: Staged archive is missing x-ui binary."
@@ -350,15 +324,13 @@ echo -e "${green}Staged binary verified: v${new_ver}${plain}"
 mkdir -p "${stage_dir}/helper-scripts"
 if [[ -n "${bundled_scripts_dir}" && -d "${bundled_scripts_dir}" ]]; then
     cp -f "${bundled_scripts_dir}/"*.sh "${stage_dir}/helper-scripts/" 2>/dev/null || true
-elif [[ -z "${offline_archive}" ]]; then
-    for sname in backup.sh rollback.sh update.sh install.sh; do
-        curl -fsSL --retry 3 --connect-timeout 10 \
-            "https://raw.githubusercontent.com/${CLEAN_REPO}/main/scripts/${sname}" \
-            -o "${stage_dir}/helper-scripts/${sname}" 2>/dev/null || true
-    done
+
 fi
 
-# ------------------------------------------------------------------------------
+# Refuse known-vulnerable helper bundles before touching the live service.
+[[ -s "${stage_dir}/helper-scripts/rollback.sh" ]] || _fail "ERROR: Missing rollback helper in release bundle"
+grep -q '^# CLEAN_SCRIPT_PROTOCOL=2$' "${stage_dir}/helper-scripts/rollback.sh" ||
+    _fail "ERROR: Outdated release bundle; rebuild a release with the reviewed maintenance scripts."
 # Step 2: Stop Service (Verified) & Create Verified Pre-Upgrade Backup
 # ------------------------------------------------------------------------------
 echo -e "${green}[2/6] Staging backup, stopping x-ui, and verifying SQLite snapshot...${plain}"
@@ -368,6 +340,12 @@ old_ver="$("${xui_folder}/x-ui" -v 2>/dev/null | head -n1 | tr -d '[:space:]' ||
 pre_settings="$("${xui_folder}/x-ui" setting -show true 2>/dev/null || true)"
 existing_port="$(echo "${pre_settings}" | grep -Eo 'port: .+' | awk '{print $2}' | head -n1 || true)"
 existing_webBasePath="$(echo "${pre_settings}" | grep -Eo 'webBasePath: .+' | awk '{print $2}' | head -n1 || true)"
+pre_port="${existing_port}"
+pre_webBasePath="${existing_webBasePath}"
+pre_listenIP="$(echo "${pre_settings}" | grep -Eo 'listenIP: .+' | awk '{print $2}' | head -n1 || true)"
+[[ "${pre_port}" =~ ^[0-9]+$ && "${pre_port}" -ge 1 && "${pre_port}" -le 65535 ]] ||
+    _fail "ERROR: Could not read original listening port; refusing in-place upgrade"
+[[ -s "${xui_db_folder}/x-ui.db" ]] || _fail "ERROR: Existing SQLite database missing or empty"
 
 mkdir -p "${backup_root}"
 chmod 700 "${backup_root}"
@@ -387,10 +365,16 @@ if [[ -d "${xui_service}/x-ui.service.d" ]]; then
 fi
 
 # Now stop x-ui and strictly verify it is no longer running
+service_stopped_by_us=1
 if ! _stop_xui_and_verify; then
     _fail "ERROR: Failed to stop x-ui service cleanly within 15s! Refusing to proceed while process is active."
 fi
 
+# Re-capture Xray's runtime config after the old panel has stopped.
+if [[ -f "${xui_folder}/bin/config.json" ]]; then
+    cp -a "${xui_folder}/bin/config.json" "${bkp_stage}/main/bin/config.json"
+fi
+# Copy the SQLite database and its matching WAL/SHM after all known writers stop.
 # Copy database folder now that x-ui is stopped and WAL is flushed
 if [[ -d "${xui_db_folder}" ]]; then
     cp -a "${xui_db_folder}/." "${bkp_stage}/db/"
@@ -452,6 +436,29 @@ chmod 600 "${pre_upgrade_backup}"
 chmod 600 "${pre_upgrade_backup}.sha256"
 ln -sfn "${pre_upgrade_backup}" "${backup_root}/latest.tar.gz"
 ln -sfn "${pre_upgrade_backup}.sha256" "${backup_root}/latest.tar.gz.sha256"
+(cd "${backup_root}" && sha256sum -c "$(basename "${pre_upgrade_backup}.sha256")" >/dev/null) ||
+    _fail "CRITICAL: Failed to verify backup archive checksum"
+command -v python3 >/dev/null 2>&1 || _fail "CRITICAL: python3 is required to validate WAL snapshot"
+python3 - "${pre_upgrade_backup}" <<'PY'
+import os, sqlite3, shutil, sys, tarfile, tempfile
+with tarfile.open(sys.argv[1], 'r:gz') as ar:
+    with tempfile.TemporaryDirectory(prefix='xui-db-verify-', dir='/var/tmp') as d:
+        for name in ['./db/x-ui.db', './db/x-ui.db-wal', './db/x-ui.db-shm']:
+            try:
+                member = ar.getmember(name)
+            except KeyError:
+                continue
+            with ar.extractfile(member) as src, open(os.path.join(d, os.path.basename(name)), 'wb') as out:
+                shutil.copyfileobj(src, out)
+        con = sqlite3.connect(f'file:{d}/x-ui.db?mode=ro', uri=True, timeout=15)
+        try:
+            value = con.execute('PRAGMA integrity_check').fetchone()[0]
+            if value != 'ok':
+                raise RuntimeError('SQLite integrity_check returned '+str(value))
+        finally:
+            con.close()
+print('WAL-consistent backup integrity: OK')
+PY
 echo -e "${green}Verified pre-upgrade backup saved to: ${pre_upgrade_backup}${plain}"
 
 # Backup is 100% verified on disk — arm auto-rollback for Steps 3..6
@@ -474,6 +481,15 @@ fi
 
 for item in "${stage_dir}/x-ui/bin/"*; do
     [[ -e "${item}" ]] || continue
+    item_name="$(basename "${item}")"
+    # Never replace the generated Xray configuration, even on explicit runtime upgrade.
+    [[ "${item_name}" == "config.json" ]] && continue
+    # This is a clean panel-only upgrade. Preserve working Xray/MTG/geo data
+    # unless the operator explicitly opts into upgrading bundled runtime dependencies.
+    if [[ -e "${xui_folder}/bin/${item_name}" &&
+          "${XUI_UPGRADE_RUNTIME_DEPS:-0}" != "1" ]]; then
+        continue
+    fi
     cp -rf "${item}" "${xui_folder}/bin/"
 done
 chmod +x "${xui_folder}"/bin/xray-linux-* "${xui_folder}"/bin/mtg-linux-* 2>/dev/null || true
@@ -496,6 +512,11 @@ settings_out="$("${xui_folder}/x-ui" setting -show true 2>/dev/null || true)"
 [[ -z "${settings_out}" ]] && _fail "ERROR: Failed to read panel settings after migration!"
 existing_port="$(echo "${settings_out}" | grep -Eo 'port: .+' | awk '{print $2}' | head -n1 || true)"
 existing_webBasePath="$(echo "${settings_out}" | grep -Eo 'webBasePath: .+' | awk '{print $2}' | head -n1 || true)"
+post_listenIP="$(echo "${settings_out}" | grep -Eo 'listenIP: .+' | awk '{print $2}' | head -n1 || true)"
+[[ "${existing_port}" == "${pre_port}" &&
+   "${existing_webBasePath}" == "${pre_webBasePath}" &&
+   "${post_listenIP}" == "${pre_listenIP}" ]] ||
+    _fail "ERROR: port, webBasePath, or listenIP changed during migration; refusing to commit"
 
 # ------------------------------------------------------------------------------
 # Step 5: Refresh Service Unit & Sandbox Drop-In
@@ -518,24 +539,14 @@ else
             [[ -f "${stage_dir}/x-ui/x-ui.service.rhel" ]] && unit_src="${stage_dir}/x-ui/x-ui.service.rhel"
             ;;
     esac
-    if [[ -f "${unit_src}" ]]; then
+    # Pure ad-removal upgrade: preserve the production unit and all local
+    # sandbox/Cloudflare-related drop-ins. Opt in only when explicitly requested.
+    if [[ "${XUI_REPLACE_SYSTEMD:-0}" == "1" ]]; then
+        [[ -f "${unit_src}" ]] || _fail "ERROR: Requested systemd replacement but packaged unit is absent"
         cp -f "${unit_src}" "${xui_service}/x-ui.service"
     fi
-    dropin_dir="${xui_service}/x-ui.service.d"
-    mkdir -p "${dropin_dir}"
-    sys_ver="$(systemctl --version 2>/dev/null | awk 'NR == 1 {print $2}' | tr -cd '0-9' || true)"
-    {
-        echo "[Service]"
-        echo "ReadWritePaths=-${xui_db_folder} -${xui_folder} -${xui_log_folder} -${backup_root}"
-        echo "ReadWriteDirectories=-${xui_db_folder} -${xui_folder} -${xui_log_folder} -${backup_root}"
-        if [[ -n "${sys_ver}" && "${sys_ver}" -ge 239 ]]; then
-            echo "SystemCallFilter=@system-service"
-            echo "SystemCallErrorNumber=EPERM"
-        fi
-    } > "${dropin_dir}/10-xui-sandbox.conf"
-
+    # Default: do not rewrite 10-xui-sandbox.conf (or any administrator override).
     systemctl daemon-reload
-    systemctl enable x-ui >/dev/null 2>&1 || true
     systemctl start x-ui || _fail "ERROR: systemctl start x-ui failed!"
 fi
 
@@ -544,21 +555,21 @@ fi
 # ------------------------------------------------------------------------------
 echo -e "${green}[6/6] Running post-upgrade health checks...${plain}"
 healthy=0
-for _ in 1 2 3 4 5; do
+command -v ss >/dev/null 2>&1 || _fail "ERROR: ss from iproute2 is required for health check"
+for _ in {1..15}; do
     sleep 2
-    if command -v systemctl >/dev/null 2>&1; then
-        if ! systemctl is-active --quiet x-ui; then
-            continue
-        fi
-    fi
-    if [[ -n "${existing_port}" ]] && command -v ss >/dev/null 2>&1; then
-        if ss -tln 2>/dev/null | grep -qE ":${existing_port}\\b"; then
+    systemctl is-active --quiet x-ui || continue
+    if [[ -n "${pre_listenIP}" ]]; then
+        expected_socket="${pre_listenIP}:${existing_port}"
+        if ss -H -ltn | awk -v expected="${expected_socket}" '$4 == expected {found=1} END {exit !found}'; then
             healthy=1
             break
         fi
     else
-        healthy=1
-        break
+        if ss -H -ltn | awk -v port=":${existing_port}" 'index($4,port)==length($4)-length(port)+1 {found=1} END {exit !found}'; then
+            healthy=1
+            break
+        fi
     fi
 done
 
@@ -568,6 +579,7 @@ fi
 
 # Health check passed — disarm auto-rollback trap
 rollback_needed=0
+service_stopped_by_us=0
 
 echo ""
 echo -e "${green}═══════════════════════════════════════════════════════════════${plain}"

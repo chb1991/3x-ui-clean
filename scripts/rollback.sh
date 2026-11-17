@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
 # 3X-UI Clean — Atomic Rollback & Full Verification Script
+# CLEAN_SCRIPT_PROTOCOL=2
 # Repository: https://github.com/chb1991/3x-ui-clean
 # License: GPL-3.0
 # ==============================================================================
@@ -15,6 +16,7 @@ xui_folder="${XUI_MAIN_FOLDER:-/usr/local/x-ui}"
 xui_db_folder="${XUI_DB_FOLDER:-/etc/x-ui}"
 xui_service="${XUI_SERVICE:-/etc/systemd/system}"
 backup_root="${XUI_BACKUP_DIR:-/var/backups/x-ui}"
+staging_root="${XUI_STAGING_DIR:-/var/tmp}"
 
 target_archive=""
 auto_mode=0
@@ -92,30 +94,21 @@ _is_xui_running() {
     if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet x-ui 2>/dev/null; then
         return 0
     fi
-    if pgrep -f "${xui_folder}/x-ui" >/dev/null 2>&1; then
+    if pgrep -x x-ui >/dev/null 2>&1; then
         return 0
     fi
     return 1
 }
 
 _stop_xui_and_verify() {
-    log_info "Stopping x-ui service and sidecars..."
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl stop x-ui 2>/dev/null || true
-    elif command -v rc-service >/dev/null 2>&1; then
-        rc-service x-ui stop 2>/dev/null || true
-    fi
-    pkill -f 'mtg-linux-[^ ]* run ' 2>/dev/null || true
-
+    log_info "Stopping x-ui and verifying process termination..."
+    systemctl stop x-ui || { log_err "systemctl stop x-ui failed; refusing to restore live database"; return 1; }
     local i
-    for i in {1..15}; do
-        if ! _is_xui_running; then
-            return 0
-        fi
+    for i in {1..20}; do
+        ! _is_xui_running && return 0
         sleep 1
     done
-
-    log_err "Failed to stop x-ui cleanly after 15s; refusing to overwrite database while process is active."
+    log_err "x-ui process still exists after stop; refusing to overwrite database"
     return 1
 }
 
@@ -157,6 +150,10 @@ if [[ ! -f "${target_archive}" ]]; then
 fi
 
 # Verify SHA256 if sidecar file exists
+if [[ ! -f "${target_archive}.sha256" ]]; then
+    log_err "Missing verified backup checksum sidecar; refusing unverified rollback"
+    exit 1
+fi
 if [[ -f "${target_archive}.sha256" ]]; then
     log_info "Verifying SHA256 checksum for $(basename "${target_archive}")..."
     if ! (cd "$(dirname "${target_archive}")" && sha256sum -c "$(basename "${target_archive}.sha256")" >/dev/null 2>&1); then
@@ -171,11 +168,17 @@ if ! tar -tzf "${target_archive}" >/dev/null 2>&1; then
     exit 1
 fi
 
-stage_dir="$(mktemp -d "/tmp/x-ui-rollback-XXXXXX")"
+install -d -m 700 "${staging_root}"
+free_kib="$(df -Pk "${staging_root}" | awk 'NR == 2 {print $4}')"
+[[ "${free_kib}" =~ ^[0-9]+$ && "${free_kib}" -ge 262144 ]] || { log_err "Need at least 256 MiB on disk-backed staging"; exit 1; }
+stage_dir="$(mktemp -d "${staging_root}/x-ui-rollback-XXXXXX")"
 trap 'rm -rf "${stage_dir}"' EXIT
 
 log_info "Extracting backup archive $(basename "${target_archive}")..."
 tar -C "${stage_dir}" -xzf "${target_archive}"
+[[ -s "${stage_dir}/db/x-ui.db" && -s "${stage_dir}/main/x-ui" && -f "${stage_dir}/backup-meta.env" ]] || {
+    log_err "Backup missing required SQLite DB, binary or manifest"; exit 1;
+}
 
 PANEL_VERSION=""
 PANEL_PORT=""
@@ -183,11 +186,30 @@ BACKUP_CREATED_UTC=""
 DB_SHA256=""
 BIN_SHA256=""
 
-if [[ -f "${stage_dir}/backup-meta.env" ]]; then
-    # shellcheck disable=SC1090
-    source "${stage_dir}/backup-meta.env"
-    log_info "Backup Metadata: Version=${PANEL_VERSION:-unknown}, Port=${PANEL_PORT:-unknown}, Created=${BACKUP_CREATED_UTC:-unknown}"
-fi
+# Read only allowlisted fields as inert data. Never 'source' an archive file as root.
+read_meta() {
+    local key="$1"
+    sed -n "s/^${key}=\"\\([^\"]*\\)\"$/\\1/p" "${stage_dir}/backup-meta.env" | head -n 1
+}
+PANEL_VERSION="$(read_meta PANEL_VERSION)"
+PANEL_PORT="$(read_meta PANEL_PORT)"
+BACKUP_CREATED_UTC="$(read_meta BACKUP_CREATED_UTC)"
+DB_SHA256="$(read_meta DB_SHA256)"
+BIN_SHA256="$(read_meta BIN_SHA256)"
+[[ "${DB_SHA256}" =~ ^[0-9a-f]{64}$ && "${BIN_SHA256}" =~ ^[0-9a-f]{64}$ ]] || {
+    log_err "Backup manifest missing valid SHA256 fields; refusing restore"
+    exit 1
+}
+[[ "$(sha256sum "${stage_dir}/db/x-ui.db" | awk '{print $1}')" == "${DB_SHA256}" &&
+   "$(sha256sum "${stage_dir}/main/x-ui" | awk '{print $1}')" == "${BIN_SHA256}" ]] || {
+    log_err "Archived binary or database does not match backup manifest; refusing restore"
+    exit 1
+}
+[[ -z "${PANEL_PORT}" || "${PANEL_PORT}" =~ ^[0-9]{1,5}$ ]] || {
+    log_err "Backup metadata has invalid panel port"
+    exit 1
+}
+log_info "Backup Metadata: Version=${PANEL_VERSION:-unknown}, Port=${PANEL_PORT:-unknown}, Created=${BACKUP_CREATED_UTC:-unknown}"
 
 if [[ "${auto_mode}" -eq 0 ]]; then
     read -rp "Confirm restoring this backup? This will stop x-ui and restore files [y/N]: " confirm
@@ -197,7 +219,17 @@ if [[ "${auto_mode}" -eq 0 ]]; then
     fi
 fi
 
-# Stop x-ui and verify termination before restoring files
+# Restore only after all archive checks are complete, never touch an active SQLite DB.
+[[ "${xui_folder}" == "/usr/local/x-ui" ]] || { log_err "Unexpected installation directory; refusing destructive restore"; exit 1; }
+command -v python3 >/dev/null 2>&1 || { log_err "python3 required for SQLite integrity validation"; exit 1; }
+python3 - "${stage_dir}/db/x-ui.db" <<'PY'
+import sqlite3,sys
+db=sqlite3.connect("file:"+sys.argv[1]+"?mode=ro", uri=True, timeout=15)
+try:
+    value=db.execute("PRAGMA integrity_check").fetchone()[0]
+    if value != "ok": raise RuntimeError("PRAGMA integrity_check: "+str(value))
+finally: db.close()
+PY
 _stop_xui_and_verify
 
 # 1. Restore database folder (/etc/x-ui) unless --binary-only
@@ -234,7 +266,7 @@ fi
 if [[ -d "${stage_dir}/main" ]]; then
     log_info "Restoring application directory ${xui_folder}..."
     mkdir -p "${xui_folder}"
-    rm -rf "${xui_folder:?}/"*
+    find "${xui_folder}" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
     cp -a "${stage_dir}/main/." "${xui_folder}/"
     chmod +x "${xui_folder}/x-ui" "${xui_folder}/x-ui.sh" 2>/dev/null || true
     chmod +x "${xui_folder}"/bin/xray-linux-* "${xui_folder}"/bin/mtg-linux-* 2>/dev/null || true
@@ -260,6 +292,9 @@ if [[ -f "${stage_dir}/system/default-x-ui" ]]; then
 fi
 if [[ -f "${stage_dir}/system/x-ui.service" ]]; then
     cp -a "${stage_dir}/system/x-ui.service" "${xui_service}/x-ui.service"
+fi
+if [[ -d "${xui_service}/x-ui.service.d" ]]; then
+    find "${xui_service}/x-ui.service.d" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 fi
 if [[ -d "${stage_dir}/system/x-ui.service.d" ]]; then
     mkdir -p "${xui_service}/x-ui.service.d"

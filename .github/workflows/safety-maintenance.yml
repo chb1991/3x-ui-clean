@@ -1,0 +1,59 @@
+name: Maintenance Script Safety Checks
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/**'
+      - 'install.sh'
+      - 'update.sh'
+      - 'tests/**'
+      - '.github/workflows/safety-maintenance.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: validate-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell-safety:
+    name: Shell syntax and maintenance contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Bash syntax
+        run: |
+          set -euo pipefail
+          for script in scripts/install.sh scripts/update.sh scripts/backup.sh scripts/rollback.sh install.sh update.sh; do
+            echo "Checking ${script}"
+            bash -n "${script}"
+          done
+      - name: Ensure root and script entrypoints agree
+        run: |
+          set -euo pipefail
+          cmp scripts/install.sh install.sh
+          cmp scripts/update.sh update.sh
+      - name: Exercise online WAL backup and failure guards (sandboxed fake service)
+        run: sudo -E bash tests/maintenance-smoke.sh
+      - name: Debian 13 isolated migration-failure rollback exercise
+        run: |
+          set -euo pipefail
+          docker run --rm -v "${PWD}:/work:ro" -w /work debian:trixie bash -ec '
+            apt-get update -qq
+            DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 procps util-linux iproute2 >/dev/null
+            bash tests/debian13-migration-failure.sh
+          '
+      - name: Check fail-closed safety contracts
+        run: |
+          set -euo pipefail
+          for script in scripts/update.sh scripts/rollback.sh scripts/install.sh; do
+            grep -q 'CLEAN_SCRIPT_PROTOCOL=2' "${script}"
+            grep -q 'XUI_STAGING_DIR:-/var/tmp' "${script}"
+          done
+          ! grep -q '/tmp/x-ui-update-stage' scripts/update.sh
+          ! grep -q '/tmp/x-ui-rollback-' scripts/rollback.sh
+          ! grep -q 'raw.githubusercontent.com/${CLEAN_REPO}/main/scripts/${sname}' scripts/update.sh
+          grep -q 'Refusing unexpected stop of active VLESS/REALITY nodes' scripts/backup.sh
+          grep -q 'Missing offline .sha256 sidecar' scripts/update.sh
