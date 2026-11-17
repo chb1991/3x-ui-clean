@@ -92,6 +92,8 @@ if [[ -f "${xui_db_folder}/x-ui.db" && -f "${xui_folder}/x-ui" && "${force_fresh
     echo -e "${yellow}═══════════════════════════════════════════════════════════════${plain}"
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd || echo "")"
     if [[ -f "${script_dir}/update.sh" ]]; then
+        grep -q '^# CLEAN_SCRIPT_PROTOCOL=2$' "${script_dir}/update.sh" ||
+            _fail "ERROR: Bundled updater is obsolete; refusing an unsafe in-place upgrade."
         exec bash "${script_dir}/update.sh" "${orig_args[@]}"
     fi
     if [[ -z "${target_tag}" ]]; then
@@ -102,6 +104,10 @@ if [[ -f "${xui_db_folder}/x-ui.db" && -f "${xui_folder}/x-ui" && "${force_fresh
     if ! curl -fsSL --retry 3 "https://raw.githubusercontent.com/${CLEAN_REPO}/${target_tag}/scripts/update.sh" -o "${tmp_up}" || [[ ! -s "${tmp_up}" ]]; then
         rm -f "${tmp_up}"
         _fail "ERROR: Unable to download release-pinned update.sh"
+    fi
+    if ! grep -q '^# CLEAN_SCRIPT_PROTOCOL=2$' "${tmp_up}"; then
+        rm -f "${tmp_up}"
+        _fail "ERROR: Release tag contains an outdated updater. Build and publish verified scripts first."
     fi
     if bash "${tmp_up}" "${orig_args[@]}"; then
         rc=0
