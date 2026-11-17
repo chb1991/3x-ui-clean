@@ -6,6 +6,7 @@ on:
       - 'scripts/**'
       - 'install.sh'
       - 'update.sh'
+      - 'tests/maintenance-smoke.sh'
       - '.github/workflows/safety-maintenance.yml'
   workflow_dispatch:
 
@@ -30,6 +31,8 @@ jobs:
           set -euo pipefail
           cmp scripts/install.sh install.sh
           cmp scripts/update.sh update.sh
+      - name: Exercise online WAL backup and failure guards (sandboxed fake service)
+        run: sudo -E bash tests/maintenance-smoke.sh
       - name: Check fail-closed safety contracts
         run: |
           set -euo pipefail
