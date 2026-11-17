@@ -334,6 +334,12 @@ old_ver="$("${xui_folder}/x-ui" -v 2>/dev/null | head -n1 | tr -d '[:space:]' ||
 pre_settings="$("${xui_folder}/x-ui" setting -show true 2>/dev/null || true)"
 existing_port="$(echo "${pre_settings}" | grep -Eo 'port: .+' | awk '{print $2}' | head -n1 || true)"
 existing_webBasePath="$(echo "${pre_settings}" | grep -Eo 'webBasePath: .+' | awk '{print $2}' | head -n1 || true)"
+pre_port="${existing_port}"
+pre_webBasePath="${existing_webBasePath}"
+pre_listenIP="$(echo "${pre_settings}" | grep -Eo 'listenIP: .+' | awk '{print $2}' | head -n1 || true)"
+[[ "${pre_port}" =~ ^[0-9]+$ && "${pre_port}" -ge 1 && "${pre_port}" -le 65535 ]] ||
+    _fail "ERROR: Could not read original listening port; refusing in-place upgrade"
+[[ -s "${xui_db_folder}/x-ui.db" ]] || _fail "ERROR: Existing SQLite database missing or empty"
 
 mkdir -p "${backup_root}"
 chmod 700 "${backup_root}"
@@ -358,6 +364,11 @@ if ! _stop_xui_and_verify; then
     _fail "ERROR: Failed to stop x-ui service cleanly within 15s! Refusing to proceed while process is active."
 fi
 
+# Re-capture Xray's runtime config after the old panel has stopped.
+if [[ -f "${xui_folder}/bin/config.json" ]]; then
+    cp -a "${xui_folder}/bin/config.json" "${bkp_stage}/main/bin/config.json"
+fi
+# Copy the SQLite database and its matching WAL/SHM after all known writers stop.
 # Copy database folder now that x-ui is stopped and WAL is flushed
 if [[ -d "${xui_db_folder}" ]]; then
     cp -a "${xui_db_folder}/." "${bkp_stage}/db/"
@@ -487,6 +498,11 @@ settings_out="$("${xui_folder}/x-ui" setting -show true 2>/dev/null || true)"
 [[ -z "${settings_out}" ]] && _fail "ERROR: Failed to read panel settings after migration!"
 existing_port="$(echo "${settings_out}" | grep -Eo 'port: .+' | awk '{print $2}' | head -n1 || true)"
 existing_webBasePath="$(echo "${settings_out}" | grep -Eo 'webBasePath: .+' | awk '{print $2}' | head -n1 || true)"
+post_listenIP="$(echo "${settings_out}" | grep -Eo 'listenIP: .+' | awk '{print $2}' | head -n1 || true)"
+[[ "${existing_port}" == "${pre_port}" &&
+   "${existing_webBasePath}" == "${pre_webBasePath}" &&
+   "${post_listenIP}" == "${pre_listenIP}" ]] ||
+    _fail "ERROR: port, webBasePath, or listenIP changed during migration; refusing to commit"
 
 # ------------------------------------------------------------------------------
 # Step 5: Refresh Service Unit & Sandbox Drop-In
@@ -535,21 +551,21 @@ fi
 # ------------------------------------------------------------------------------
 echo -e "${green}[6/6] Running post-upgrade health checks...${plain}"
 healthy=0
-for _ in 1 2 3 4 5; do
+command -v ss >/dev/null 2>&1 || _fail "ERROR: ss from iproute2 is required for health check"
+for _ in {1..15}; do
     sleep 2
-    if command -v systemctl >/dev/null 2>&1; then
-        if ! systemctl is-active --quiet x-ui; then
-            continue
-        fi
-    fi
-    if [[ -n "${existing_port}" ]] && command -v ss >/dev/null 2>&1; then
-        if ss -tln 2>/dev/null | grep -qE ":${existing_port}\\b"; then
+    systemctl is-active --quiet x-ui || continue
+    if [[ -n "${pre_listenIP}" ]]; then
+        expected_socket="${pre_listenIP}:${existing_port}"
+        if ss -H -ltn | awk -v expected="${expected_socket}" '$4 == expected {found=1} END {exit !found}'; then
             healthy=1
             break
         fi
     else
-        healthy=1
-        break
+        if ss -H -ltn | awk -v port=":${existing_port}" 'index($4,port)==length($4)-length(port)+1 {found=1} END {exit !found}'; then
+            healthy=1
+            break
+        fi
     fi
 done
 
