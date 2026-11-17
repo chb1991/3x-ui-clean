@@ -8,6 +8,7 @@ test ! -e /etc/x-ui/x-ui.db || { echo "Refusing to touch pre-existing x-ui"; exi
 umask 077
 mkdir -p /etc/x-ui /usr/local/x-ui/bin /etc/systemd/system/x-ui.service.d /var/backups/x-ui /var/tmp /tmp/fake-bin
 printf 'OLD-EXACT-REALITY-CONFIG\n' > /usr/local/x-ui/bin/config.json
+printf 'OLD-XRAY-CORE\n' > /usr/local/x-ui/bin/xray-linux-amd64
 printf 'OLD-SYSTEMD-UNIT\n' > /etc/systemd/system/x-ui.service
 printf 'OLD-DROPIN\n' > /etc/systemd/system/x-ui.service.d/10-xui-sandbox.conf
 
@@ -69,6 +70,7 @@ PY
 )"
 original_bin_sha="$(sha256sum /usr/local/x-ui/x-ui | cut -d' ' -f1)"
 original_conf_sha="$(sha256sum /usr/local/x-ui/bin/config.json | cut -d' ' -f1)"
+original_xray_sha="$(sha256sum /usr/local/x-ui/bin/xray-linux-amd64 | cut -d' ' -f1)"
 
 mkdir -p /tmp/pkg/x-ui/bin /tmp/bundle/3x-ui-clean-offline/scripts
 cat >/tmp/pkg/x-ui/x-ui <<'NEW'
@@ -87,6 +89,7 @@ echo NEW
 SH
 chmod +x /tmp/pkg/x-ui/x-ui.sh
 echo NEW-CONFIG-SHOULD-NOT-BE-INSTALLED > /tmp/pkg/x-ui/bin/config.json
+printf 'NEW-XRAY-CORE\n' > /tmp/pkg/x-ui/bin/xray-linux-amd64
 printf 'NEW-UNIT\n' > /tmp/pkg/x-ui/x-ui.service.debian
 cp scripts/*.sh /tmp/bundle/3x-ui-clean-offline/scripts/
 (cd /tmp/pkg && tar -czf /tmp/bundle/3x-ui-clean-offline/x-ui-linux-amd64.tar.gz x-ui)
@@ -116,3 +119,40 @@ conn.close()
 PY
 [[ -f /var/backups/x-ui/latest.tar.gz ]] || { echo 'Upgrade backup not persisted'; exit 1; }
 echo 'PASS: Debian 13 migration failure caused rollback; SQLite, REALITY, binary, systemd files and service preserved'
+
+
+# Now verify a SUCCESSFUL clean upgrade after the rollback test.
+# Application changes, while REALITY / Xray core and original panel settings remain.
+cat >/tmp/pkg/x-ui/x-ui <<'NEW'
+#!/usr/bin/env bash
+case "${1:-}" in
+  -v) echo '3.11.0';;
+  setting) printf 'port: 38627\nwebBasePath: /original-base/\nlistenIP: 127.0.0.1\n';;
+  migrate) exit 0;;
+  *) exit 0;;
+esac
+NEW
+chmod +x /tmp/pkg/x-ui/x-ui
+(cd /tmp/pkg && tar -czf /tmp/bundle/3x-ui-clean-offline/x-ui-linux-amd64.tar.gz x-ui)
+(cd /tmp/bundle/3x-ui-clean-offline && sha256sum x-ui-linux-amd64.tar.gz > x-ui-linux-amd64.tar.gz.sha256)
+(cd /tmp/bundle && tar -czf /var/tmp/simulated-clean-success.tar.gz 3x-ui-clean-offline)
+(cd /var/tmp && sha256sum simulated-clean-success.tar.gz > simulated-clean-success.tar.gz.sha256)
+NONINTERACTIVE=1 bash scripts/update.sh --offline /var/tmp/simulated-clean-success.tar.gz --yes >/tmp/simulated-success.log 2>&1 || {
+    cat /tmp/simulated-success.log
+    exit 1
+}
+[[ -f /tmp/fake-service-active ]] || { echo 'Successful upgrade did not start service'; exit 1; }
+[[ "$(sha256sum /usr/local/x-ui/bin/config.json | cut -d' ' -f1)" == "${original_conf_sha}" ]] || {
+    echo 'Generated Xray config overwritten during successful upgrade'; exit 1;
+}
+[[ "$(sha256sum /usr/local/x-ui/bin/xray-linux-amd64 | cut -d' ' -f1)" == "${original_xray_sha}" ]] || {
+    echo 'Runtime Xray core unexpectedly replaced'; exit 1;
+}
+python3 - <<'PY'
+import sqlite3
+db=sqlite3.connect('/etc/x-ui/x-ui.db')
+assert db.execute('PRAGMA integrity_check').fetchone()[0]=='ok'
+assert db.execute('SELECT v FROM secrets WHERE k=?',('REALITY',)).fetchone()[0] == 'keep-this-key'
+db.close()
+PY
+echo 'PASS: Debian 13 successful clean upgrade preserves REALITY, Xray config, Xray binary and panel settings'
