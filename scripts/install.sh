@@ -163,7 +163,11 @@ TARGET_ARCH="$(arch)"
 
 gen_random_string() {
     local length="$1"
-    LC_ALL=C tr -dc 'a-zA-Z0-9' </dev/urandom | fold -w "${length}" | head -n 1
+    shuf -e -r -n "${length}" \
+        --random-source=/dev/urandom \
+        {A..Z} {a..z} {0..9} |
+        tr -d '\n'
+    printf '\n'
 }
 
 # Install base dependencies in online mode only
